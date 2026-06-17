@@ -1,0 +1,49 @@
+wandb_project: test-swanlab-v2
+
+backbone_signature: /root/dataset/weights/stable-diffusion-v1-5-min
+
+train_shards:
+  - /root/shuqian/dataset/AR_LBM_wds/ar_train-{000000..000000}.tar
+
+validation_shards:
+  - /root/shuqian/dataset/AR_LBM_wds/ar_val-{000000..000000}.tar
+
+source_key: image
+target_key: normal
+mask_key: mask
+
+batch_size: 2
+learning_rate: 5e-5
+optimizer: AdamW
+
+num_steps: [1, 2, 4]
+
+timestep_sampling: uniform
+
+unet_input_channels: 4
+vae_num_channels: 4
+
+pixel_loss_type: lpips
+pixel_loss_weight: 10.0
+
+latent_loss_type: l2
+latent_loss_weight: 1.0
+
+conditioning_images_keys: []
+conditioning_masks_keys: []
+
+save_ckpt_path: /root/storage/shuqian/LBM_out/AR_sd15_swanlab_loss_test-v2
+log_interval: 10
+resume_from_checkpoint: false
+max_epochs: 3
+bridge_noise_sigma: 0.005
+save_interval: 100
+
+
+val_check_interval: 50
+limit_val_batches: 1
+
+eval_num_steps: [1, 2, 4]
+eval_max_batches: 1
+eval_max_samples: 1
+eval_upload_images: false

@@ -1,0 +1,82 @@
+wandb_project: lbm-ar-sketch2photo-sd15v3-lpips10-5-11  #实验名
+
+backbone_signature: /root/dataset/weights/stable-diffusion-v1-5-min  #sd15权重路径
+
+train_shards:
+  - /root/shuqian/dataset/AR_LBM_wds/ar_train-{000000..000000}.tar
+
+validation_shards:
+  - /root/shuqian/dataset/AR_LBM_wds/ar_val-{000000..000000}.tar
+
+source_key: image
+target_key: normal
+mask_key: mask
+
+batch_size: 2
+learning_rate: 5e-5
+optimizer: AdamW
+
+num_steps: [1, 2, 4]
+
+timestep_sampling: uniform
+
+unet_input_channels: 4
+vae_num_channels: 4
+
+pixel_loss_type: lpips
+pixel_loss_weight: 10.0
+
+latent_loss_type: l2
+latent_loss_weight: 1.0
+
+conditioning_images_keys: []
+conditioning_masks_keys: []
+
+save_ckpt_path: /root/storage/shuqian/LBM_out/AR_sd15_bs2_lpips10_5-11
+log_interval: 250        #隔多久想swanlab记录一次 loss/train  5epoch
+resume_from_checkpoint: true  #是否继续训练
+max_epochs: 501
+bridge_noise_sigma: 0.005
+save_interval: 2500   #多久保存一次权重  50epoch
+
+val_check_interval: 500  #多久进行一次评估  10epoch
+limit_val_batches: 12  #总共跑几个 batch
+
+eval_num_steps: [1, 2, 4]  #评估时要采样的步数
+eval_max_batches: 12    #每次评估用几个 validation batch
+eval_max_samples: 2    #每个评估 batch 里最多取几张图用于生成图像和计算指标
+eval_upload_images: false # 是否上传评估拼图
+
+eval_compute_fid: false #是否计算fid
+
+# 评估时保存图片
+eval_save_images: true  #是否保存
+eval_save_size: [200, 250]   # [width, height]
+eval_save_dir: null          # 不写则默认保存到 save_ckpt_path/eval_images
+
+#训练中评估在256×256 空间里算的
+
+# 外部指标计算
+eval_external_metrics: true
+eval_external_metrics_steps: [4]
+eval_external_metrics_every_n_evals: 3   # 每次评估都算；可改成2、3降低频率
+eval_external_metrics_device: cpu        # 推荐 cpu，避免和训练抢GPU
+eval_external_metrics_batch_size: 8
+
+# GT 原图文件夹
+eval_gt_dir: /root/shuqian/dataset/AR_LBM_raw/test_B
+
+# 选择要算什么
+eval_external_image_metrics: true
+eval_external_rank_metrics: true
+
+# 权重缓存路径
+eval_external_deepface_home: /root/shuqian/checkpoints
+eval_external_inception_v3_path: /root/shuqian/checkpoints/inception_v3_google-0cc3c7bd.pth
+
+# 外部指标脚本
+eval_external_metrics_script: tools/calc_external_metrics.py
+
+eval_external_metrics_wait_on_fit_end: true
+eval_external_metrics_wait_timeout: 600
+eval_external_metrics_poll_interval: 5

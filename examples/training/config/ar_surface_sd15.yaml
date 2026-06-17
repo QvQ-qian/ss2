@@ -1,0 +1,37 @@
+wandb_project: lbm-ar-sketch2photo-sd15
+
+backbone_signature: /root/dataset/weights/stable-diffusion-v1-5-min
+
+train_shards:
+  - /root/shuqian/dataset/AR_LBM_wds/ar_train-{000000..000000}.tar
+
+validation_shards:
+  - /root/shuqian/dataset/AR_LBM_wds/ar_val-{000000..000000}.tar
+
+source_key: image
+target_key: normal
+mask_key: mask
+
+batch_size: 2
+learning_rate: 5e-5
+optimizer: AdamW
+
+num_steps: [1, 2, 4]
+
+timestep_sampling: uniform
+
+pixel_loss_type: lpips
+pixel_loss_weight: 5.0
+
+latent_loss_type: l2
+latent_loss_weight: 1.0
+
+conditioning_images_keys: []
+conditioning_masks_keys: []
+
+save_ckpt_path: /root/storage/shuqian/LBM_out/AR_sd15_baseline_256
+log_interval: 100
+resume_from_checkpoint: true
+max_epochs: 321
+bridge_noise_sigma: 0.005
+save_interval: 2000
