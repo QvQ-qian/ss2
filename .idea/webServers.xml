@@ -5,6 +5,9 @@
       <webServer id="3b6a1a70-8670-44e2-9a3b-66ed06aa1945" name="三卡lbm">
         <fileTransfer accessType="SFTP" host="192.168.31.227" port="12117" sshConfigId="8a6d91cc-6a3b-46b3-8c8f-f50a5420a34f" sshConfig="root@192.168.31.227:12117 password" />
       </webServer>
+      <webServer id="4607f359-fbb5-4df5-8ff4-2bea2dba4a26" name="三卡Bi-lbm">
+        <fileTransfer accessType="SFTP" host="192.168.31.227" port="12117" sshConfigId="8a6d91cc-6a3b-46b3-8c8f-f50a5420a34f" sshConfig="root@192.168.31.227:12117 password" />
+      </webServer>
     </option>
   </component>
 </project>

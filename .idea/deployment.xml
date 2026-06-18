@@ -16,13 +16,6 @@
           </mappings>
         </serverdata>
       </paths>
-      <paths name="root@192.168.31.227:12117 password (6)">
-        <serverdata>
-          <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
       <paths name="root@192.168.31.227:12117 password (7)">
         <serverdata>
           <mappings>
@@ -41,6 +34,13 @@
         <serverdata>
           <mappings>
             <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="三卡Bi-lbm">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/shuqian/projects/Bi-LBM" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>

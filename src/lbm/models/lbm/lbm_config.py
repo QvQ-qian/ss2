@@ -109,6 +109,22 @@ class LBMConfig(ModelConfig):
     selected_timesteps: Optional[List[float]] = None
     prob: Optional[List[float]] = None
     bridge_noise_sigma: float = 0.001
+    # Bidirectional LBM
+    bidirectional: bool = False
+    bidirectional_mode: str = "none"  # "none" or "two_bridge"
+
+    direction_aware: bool = False
+    num_directions: int = 2
+    direction_embed_init: float = 0.0
+
+    reverse_loss_weight: float = 0.5
+    reverse_use_pixel_loss: bool = False
+    reverse_use_id_loss: bool = False
+    reverse_use_local_edge_loss: bool = False
+
+    # Validation / sampling behavior
+    eval_directions: Optional[List[str]] = None
+    eval_save_p2s_images: bool = False
     # Face parsing adapter
     use_face_adapter: bool = False
     parse_key: str = "parse"

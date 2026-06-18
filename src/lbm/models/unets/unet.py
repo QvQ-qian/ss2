@@ -72,24 +72,43 @@ class DiffusersUNet2DCondWrapper(UNet2DConditionModel):
         self._bridge_maam_handles = []
         self._bridge_maam_logs = []
         self.bridge_maam_use_timestep = True
+        # Direction-aware Bi-LBM.
+        # Keep disabled during SD1.5 strict weight loading.
+        # Call enable_direction_embedding(...) after denoiser.load_state_dict(..., strict=True).
+        self.use_direction_embedding = False
+        self.num_directions = 0
 
     def forward(
-        self,
-        sample: torch.Tensor,
-        timestep: Union[torch.Tensor, float, int],
-        conditioning: Dict[str, torch.Tensor],
-        ip_adapter_cond_embedding: Optional[List[torch.Tensor]] = None,
-        down_block_additional_residuals: torch.Tensor = None,
-        mid_block_additional_residual: torch.Tensor = None,
-        down_intrablock_additional_residuals: torch.Tensor = None,
-        *args,
-        **kwargs,
+            self,
+            sample: torch.Tensor,
+            timestep: Union[torch.Tensor, float, int],
+            conditioning: Dict[str, torch.Tensor],
+            ip_adapter_cond_embedding: Optional[List[torch.Tensor]] = None,
+            down_block_additional_residuals: torch.Tensor = None,
+            mid_block_additional_residual: torch.Tensor = None,
+            down_intrablock_additional_residuals: torch.Tensor = None,
+            direction_ids: Optional[torch.Tensor] = None,
+            *args,
+            **kwargs,
     ):
         assert isinstance(conditioning, dict), "conditionings must be a dictionary"
 
         class_labels = conditioning["cond"].get("vector", None)
         crossattn = conditioning["cond"].get("crossattn", None)
         concat = conditioning["cond"].get("concat", None)
+
+        if self.use_direction_embedding:
+            if direction_ids is None:
+                raise ValueError(
+                    "Direction embedding is enabled, but direction_ids is None. "
+                    "Pass direction_ids to the denoiser for Bi-LBM training/sampling."
+                )
+            if class_labels is not None:
+                raise ValueError(
+                    "Both conditioning['cond']['vector'] and direction_ids are provided. "
+                    "This first Bi-LBM implementation reserves class_labels for direction embedding."
+                )
+            class_labels = direction_ids.to(device=sample.device, dtype=torch.long)
 
         if concat is not None:
             sample = torch.cat([sample, concat], dim=1)
@@ -133,6 +152,38 @@ class DiffusersUNet2DCondWrapper(UNet2DConditionModel):
     # -------------------------------------------------------------------------
     # Bridge-aware MAAM utilities
     # -------------------------------------------------------------------------
+
+    def enable_direction_embedding(
+            self,
+            num_directions: int = 2,
+            init_scale: float = 0.0,
+    ):
+        """
+        Enable learnable direction embeddings for bidirectional LBM.
+
+        Direction ids:
+            0: source_key -> target_key, e.g. sketch -> photo
+            1: target_key -> source_key, e.g. photo -> sketch
+
+        Implementation:
+            We reuse diffusers UNet class_embedding path. When class_embedding is
+            not None, diffusers adds class_emb to the timestep embedding.
+            This does not modify conv_in / conv_out and keeps SD1.5 weights intact.
+        """
+        time_embed_dim = self._bridge_maam_time_embed_dim()
+        self.class_embedding = nn.Embedding(num_directions, time_embed_dim)
+
+        if init_scale == 0.0:
+            nn.init.zeros_(self.class_embedding.weight)
+        else:
+            nn.init.normal_(self.class_embedding.weight, mean=0.0, std=init_scale)
+
+        self.use_direction_embedding = True
+        self.num_directions = int(num_directions)
+
+        # Keep config consistent for checkpoints / reloads.
+        if hasattr(self, "register_to_config"):
+            self.register_to_config(num_class_embeds=num_directions)
 
     def _bridge_maam_time_embed_dim(self) -> int:
         if hasattr(self, "time_embedding") and hasattr(self.time_embedding, "linear_2"):

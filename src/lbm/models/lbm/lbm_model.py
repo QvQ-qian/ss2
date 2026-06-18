@@ -83,6 +83,17 @@ class LBMModel(BaseModel):
         self.target_key = config.target_key
         self.mask_key = config.mask_key
         self.bridge_noise_sigma = config.bridge_noise_sigma
+        # Bidirectional LBM
+        self.bidirectional = getattr(config, "bidirectional", False)
+        self.bidirectional_mode = getattr(config, "bidirectional_mode", "none")
+        self.direction_aware = getattr(config, "direction_aware", False)
+        self.num_directions = getattr(config, "num_directions", 2)
+        self.reverse_loss_weight = float(getattr(config, "reverse_loss_weight", 0.5))
+        self.reverse_use_pixel_loss = getattr(config, "reverse_use_pixel_loss", False)
+        self.reverse_use_id_loss = getattr(config, "reverse_use_id_loss", False)
+        self.reverse_use_local_edge_loss = getattr(
+            config, "reverse_use_local_edge_loss", False
+        )
 
         self.num_iterations = nn.Parameter(
             torch.tensor(0, dtype=torch.float32), requires_grad=False
@@ -297,7 +308,315 @@ class LBMModel(BaseModel):
         if self.conditioner is not None:
             self.conditioner.on_fit_start(device=device, *args, **kwargs)
 
+    def _forward_two_bridge_bilbm(
+            self,
+            batch: Dict[str, Any],
+            step=0,
+            batch_idx=0,
+            *args,
+            **kwargs,
+    ):
+        self.num_iterations += 1
+
+        if self.face_adapter is not None:
+            raise NotImplementedError(
+                "Two-Bridge Bi-LBM first version does not support FaceConditionalAdapter. "
+                "Please keep use_face_adapter=False for this experiment."
+            )
+
+        if self.conditioner is not None:
+            # 当前 ar_surface_sd15v9_stage1.yaml 中 conditioning_images_keys=[]
+            # 因此 conditioner 一般为空条件。若后续开启 concat/crossattn 条件，
+            # 需要明确每个方向条件应该跟 source 还是 target 对齐。
+            conditioning = self._get_conditioning(batch, *args, **kwargs)
+        else:
+            conditioning = None
+
+        # ------------------------------------------------------------
+        # A = source_key, B = target_key
+        # 当前配置中通常是:
+        #   A: image  = sketch
+        #   B: normal = photo
+        # ------------------------------------------------------------
+        pixels_A = batch[self.source_key]
+        pixels_B = batch[self.target_key]
+
+        # 为了和原 forward 一致，把 A resize 到 B 的空间大小。
+        pixels_A = torch.nn.functional.interpolate(
+            pixels_A,
+            size=pixels_B.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ).to(pixels_B.dtype)
+
+        if self.vae is not None:
+            z_A = self.vae.encode(pixels_A)
+            z_B = self.vae.encode(pixels_B)
+            downsampling_factor = self.vae.downsampling_factor
+        else:
+            z_A = pixels_A
+            z_B = pixels_B
+            downsampling_factor = 1
+
+        Bsz = z_A.shape[0]
+        device = z_A.device
+
+        valid_mask, valid_mask_for_latent = self._make_valid_masks(
+            batch=batch,
+            ref_pixels=pixels_B,
+            ref_latent=z_B,
+            downsampling_factor=downsampling_factor,
+        )
+
+        # ------------------------------------------------------------
+        # Two bridges in one large batch:
+        #   first half:  A -> B, sketch -> photo
+        #   second half: B -> A, photo  -> sketch
+        # LBM target remains z_source - z_target.
+        # ------------------------------------------------------------
+        z_src = torch.cat([z_A, z_B], dim=0)
+        z_tgt = torch.cat([z_B, z_A], dim=0)
+
+        valid_mask_for_latent_bi = torch.cat(
+            [valid_mask_for_latent, valid_mask_for_latent],
+            dim=0,
+        )
+
+        # Direction ids:
+        #   0 = source_key -> target_key
+        #   1 = target_key -> source_key
+        direction_ids = torch.cat(
+            [
+                torch.zeros(Bsz, device=device, dtype=torch.long),
+                torch.ones(Bsz, device=device, dtype=torch.long),
+            ],
+            dim=0,
+        )
+
+        # Sample independent timesteps for both directions.
+        timestep = self._timestep_sampling(n_samples=2 * Bsz, device=device)
+        sigmas = self._get_sigmas(
+            self.training_noise_scheduler,
+            timestep,
+            n_dim=4,
+            device=device,
+        )
+
+        noisy_sample = (
+                sigmas * z_src
+                + (1.0 - sigmas) * z_tgt
+                + self.bridge_noise_sigma
+                * (sigmas * (1.0 - sigmas)) ** 0.5
+                * torch.randn_like(z_src)
+        )
+
+        # Keep the exact endpoint behavior from original LBM forward.
+        for i, t in enumerate(timestep):
+            if t.item() == self.training_noise_scheduler.timesteps[0]:
+                noisy_sample[i] = z_src[i]
+
+        prediction = self.denoiser(
+            sample=noisy_sample,
+            timestep=timestep,
+            conditioning=conditioning,
+            direction_ids=direction_ids if self.direction_aware else None,
+            *args,
+            **kwargs,
+        )
+
+        target = z_src - z_tgt
+
+        if self.latent_loss_weight > 0:
+            latent_loss_vec = self.latent_loss(
+                prediction,
+                target.detach(),
+                valid_mask_for_latent_bi,
+            )
+            latent_loss_vec = self.latent_loss_weight * latent_loss_vec
+        else:
+            latent_loss_vec = torch.zeros(2 * Bsz, device=device)
+
+        latent_s2p = latent_loss_vec[:Bsz]
+        latent_p2s = latent_loss_vec[Bsz:]
+
+        loss_s2p = latent_s2p
+        loss_p2s = latent_p2s
+
+        # ------------------------------------------------------------
+        # Image-level losses:
+        # first version only applies image losses to S2P.
+        # P2S remains latent-only unless explicitly enabled later.
+        # ------------------------------------------------------------
+        denoised_sample = self._predicted_x_0(
+            model_output=prediction,
+            sample=noisy_sample,
+            sigmas=sigmas,
+        )
+
+        denoised_s2p = denoised_sample[:Bsz]
+        denoised_p2s = denoised_sample[Bsz:]
+
+        pixel_loss = self._zero_scalar(device)
+        id_recon_loss = self._zero_scalar(device)
+        local_edge_recon_loss = self._zero_scalar(device)
+
+        if (
+                self.pixel_loss_weight > 0
+                or self.id_loss_weight > 0
+                or self.local_edge_loss_weight > 0
+        ):
+            parse_for_local_loss = None
+            if self.local_edge_loss_weight > 0:
+                if self.parse_key not in batch:
+                    raise KeyError(
+                        f"local_edge_loss_weight > 0 but parse_key='{self.parse_key}' not found. "
+                        f"Available keys: {list(batch.keys())}"
+                    )
+                parse_for_local_loss = batch[self.parse_key]
+
+            # S2P image loss: target is B/photo.
+            pixel_loss_s2p, id_loss_s2p, local_edge_loss_s2p = self.image_losses(
+                denoised_s2p,
+                pixels_B.detach(),
+                valid_mask,
+                parse=parse_for_local_loss,
+            )
+
+            if self.pixel_loss_weight > 0:
+                loss_s2p = loss_s2p + self.pixel_loss_weight * pixel_loss_s2p
+                pixel_loss = (
+                    pixel_loss_s2p.mean()
+                    if hasattr(pixel_loss_s2p, "mean")
+                    else pixel_loss_s2p
+                )
+
+            if self.id_loss_weight > 0:
+                loss_s2p = loss_s2p + self.id_loss_weight * id_loss_s2p
+                id_recon_loss = (
+                    id_loss_s2p.mean()
+                    if hasattr(id_loss_s2p, "mean")
+                    else id_loss_s2p
+                )
+
+            if self.local_edge_loss_weight > 0:
+                loss_s2p = loss_s2p + self.local_edge_loss_weight * local_edge_loss_s2p
+                local_edge_recon_loss = (
+                    local_edge_loss_s2p.mean()
+                    if hasattr(local_edge_loss_s2p, "mean")
+                    else local_edge_loss_s2p
+                )
+
+        # Optional reverse image losses are intentionally disabled in v1.
+        if (
+                self.reverse_use_pixel_loss
+                or self.reverse_use_id_loss
+                or self.reverse_use_local_edge_loss
+        ):
+            raise NotImplementedError(
+                "Reverse image losses are not implemented in the first Two-Bridge Bi-LBM version. "
+                "Keep reverse_use_pixel_loss/reverse_use_id_loss/reverse_use_local_edge_loss=False."
+            )
+
+        total_loss = loss_s2p.mean() + self.reverse_loss_weight * loss_p2s.mean()
+
+        zero_log = self._zero_scalar(device)
+        ea_dists_dists_loss = getattr(self, "_last_ea_dists_dists_loss", zero_log)
+        ea_dists_edge_loss = getattr(self, "_last_ea_dists_edge_loss", zero_log)
+        ea_dists_total_loss = getattr(self, "_last_ea_dists_total_loss", zero_log)
+
+        if hasattr(self.denoiser, "get_bridge_maam_log_dict"):
+            bridge_maam_logs = self.denoiser.get_bridge_maam_log_dict(device=device)
+        else:
+            bridge_maam_logs = {
+                "bridge_maam_alpha_mean": zero_log,
+                "bridge_maam_attn_mean": zero_log,
+                "bridge_maam_attn_std": zero_log,
+                "bridge_maam_delta_ratio": zero_log,
+                "bridge_maam_direct_diff_ratio": zero_log,
+            }
+
+        return {
+            "loss": total_loss,
+
+            # Keep old keys for logger compatibility.
+            "latent_recon_loss": latent_s2p.mean(),
+            "pixel_recon_loss": pixel_loss,
+            "id_recon_loss": id_recon_loss,
+            "local_edge_recon_loss": local_edge_recon_loss,
+
+            # New Bi-LBM logs.
+            "bilbm_latent_s2p": latent_s2p.mean(),
+            "bilbm_latent_p2s": latent_p2s.mean(),
+            "bilbm_total_s2p": loss_s2p.mean(),
+            "bilbm_total_p2s": loss_p2s.mean(),
+            "bilbm_reverse_loss_weight": torch.tensor(
+                self.reverse_loss_weight, device=device
+            ),
+
+            "local_edge_mask_mean": getattr(
+                self,
+                "_last_local_edge_mask_mean",
+                zero_log,
+            ),
+            "bridge_maam_alpha_mean": bridge_maam_logs["bridge_maam_alpha_mean"],
+            "bridge_maam_attn_mean": bridge_maam_logs["bridge_maam_attn_mean"],
+            "bridge_maam_attn_std": bridge_maam_logs["bridge_maam_attn_std"],
+            "bridge_maam_delta_ratio": bridge_maam_logs["bridge_maam_delta_ratio"],
+            "bridge_maam_direct_diff_ratio": bridge_maam_logs[
+                "bridge_maam_direct_diff_ratio"
+            ],
+            "ea_dists_dists_loss": ea_dists_dists_loss,
+            "ea_dists_edge_loss": ea_dists_edge_loss,
+            "ea_dists_total_loss": ea_dists_total_loss,
+
+            # Adapter logs are zero because face adapter is disabled in v1.
+            "adapter_residual_norm": zero_log,
+            "adapter_down0_norm": zero_log,
+            "adapter_down1_norm": zero_log,
+            "adapter_down2_norm": zero_log,
+            "adapter_down3_norm": zero_log,
+
+            # For existing visualization/logging, keep S2P outputs only.
+            "predicted_hr": denoised_s2p,
+            "noisy_sample": noisy_sample[:Bsz],
+        }
+
+    def _zero_scalar(self, device):
+        return torch.zeros((), device=device)
+
+    def _make_valid_masks(
+            self,
+            batch: Dict[str, Any],
+            ref_pixels: torch.Tensor,
+            ref_latent: torch.Tensor,
+            downsampling_factor: int,
+    ):
+        if self.mask_key in batch:
+            valid_mask = batch[self.mask_key].bool()[:, 0, :, :].unsqueeze(1)
+            invalid_mask = ~valid_mask
+            valid_mask_for_latent = ~torch.max_pool2d(
+                invalid_mask.float(),
+                downsampling_factor,
+                downsampling_factor,
+            ).bool()
+            valid_mask_for_latent = valid_mask_for_latent.repeat(
+                (1, ref_latent.shape[1], 1, 1)
+            )
+        else:
+            valid_mask = torch.ones_like(ref_pixels).bool()
+            valid_mask_for_latent = torch.ones_like(ref_latent).bool()
+
+        return valid_mask, valid_mask_for_latent
+
     def forward(self, batch: Dict[str, Any], step=0, batch_idx=0, *args, **kwargs):
+        if self.bidirectional and self.bidirectional_mode == "two_bridge":
+            return self._forward_two_bridge_bilbm(
+                batch=batch,
+                step=step,
+                batch_idx=batch_idx,
+                *args,
+                **kwargs,
+            )
 
         self.num_iterations += 1
 
@@ -972,18 +1291,24 @@ class LBMModel(BaseModel):
 
     @torch.no_grad()
     def sample(
-        self,
-        z: torch.Tensor,
-        num_steps: int = 20,
-        conditioner_inputs: Optional[Dict[str, Any]] = None,
-        max_samples: Optional[int] = None,
-        verbose: bool = False,
+            self,
+            z: torch.Tensor,
+            num_steps: int = 20,
+            conditioner_inputs: Optional[Dict[str, Any]] = None,
+            max_samples: Optional[int] = None,
+            verbose: bool = False,
+            direction: str = "s2p",
     ):
         self.sampling_noise_scheduler.set_timesteps(
             sigmas=np.linspace(1, 1 / num_steps, num_steps)
         )
 
         sample = z
+
+        if direction not in {"s2p", "p2s"}:
+            raise ValueError(f"Unknown sample direction: {direction}")
+
+        direction_id = 0 if direction == "s2p" else 1
 
         # Get conditioning
         conditioning = self._get_conditioning(
@@ -1006,23 +1331,32 @@ class LBMModel(BaseModel):
             }
 
         for i, t in tqdm(
-            enumerate(self.sampling_noise_scheduler.timesteps), disable=not verbose
+                enumerate(self.sampling_noise_scheduler.timesteps), disable=not verbose
         ):
             if hasattr(self.sampling_noise_scheduler, "scale_model_input"):
                 denoiser_input = self.sampling_noise_scheduler.scale_model_input(
                     sample, t
                 )
-
             else:
                 denoiser_input = sample
 
-            # Predict noise level using denoiser using conditionings
+            direction_ids = None
+            if self.direction_aware:
+                direction_ids = torch.full(
+                    (denoiser_input.shape[0],),
+                    direction_id,
+                    device=denoiser_input.device,
+                    dtype=torch.long,
+                )
+
+            # Predict bridge drift using denoiser with direction condition
             pred = self.denoiser(
                 sample=denoiser_input,
                 timestep=t.to(z.device).repeat(denoiser_input.shape[0]),
                 conditioning=conditioning,
                 down_intrablock_additional_residuals=adapter_down_residuals,
                 mid_block_additional_residual=adapter_mid_residual,
+                direction_ids=direction_ids,
             )
 
             # Make one step on the reverse diffusion process

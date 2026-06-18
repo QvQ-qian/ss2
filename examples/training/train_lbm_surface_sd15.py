@@ -79,6 +79,18 @@ def get_model(
     target_key: str = "source_image_paste",
     mask_key: str = "mask",
     bridge_noise_sigma: float = 0.0,
+    # bidirectional LBM
+    bidirectional: bool = False,
+    bidirectional_mode: str = "none",
+    direction_aware: bool = False,
+    num_directions: int = 2,
+    direction_embed_init: float = 0.0,
+    reverse_loss_weight: float = 0.5,
+    reverse_use_pixel_loss: bool = False,
+    reverse_use_id_loss: bool = False,
+    reverse_use_local_edge_loss: bool = False,
+    eval_directions: Optional[List[str]] = None,
+    eval_save_p2s_images: bool = False,
     logit_mean: float = 0.0,
     logit_std: float = 1.0,
     pixel_loss_type: str = "lpips",
@@ -241,6 +253,14 @@ def get_model(
 
     denoiser.load_state_dict(state_dict, strict=True)
 
+    # Enable direction embedding after strict SD1.5 UNet weight loading.
+    # This keeps SD1.5 pretrained loading unchanged.
+    if direction_aware:
+        denoiser.enable_direction_embedding(
+            num_directions=num_directions,
+            init_scale=direction_embed_init,
+        )
+
     # Enable Bridge-aware MAAM after strict SD1.5 UNet weight loading.
     # This avoids breaking strict=True loading because MAAM parameters are newly added.
     if use_bridge_maam:
@@ -264,6 +284,9 @@ def get_model(
         )
 
         # New modules should follow the denoiser dtype.
+        denoiser.to(torch.bfloat16)
+
+    if direction_aware or use_bridge_maam:
         denoiser.to(torch.bfloat16)
 
     # del pipe
@@ -322,6 +345,17 @@ def get_model(
         local_edge_dilate_kernel=local_edge_dilate_kernel,
         local_edge_exclude_labels=local_edge_exclude_labels,
         local_edge_exclude_dilate_kernel=local_edge_exclude_dilate_kernel,
+        bidirectional=bidirectional,
+        bidirectional_mode=bidirectional_mode,
+        direction_aware=direction_aware,
+        num_directions=num_directions,
+        direction_embed_init=direction_embed_init,
+        reverse_loss_weight=reverse_loss_weight,
+        reverse_use_pixel_loss=reverse_use_pixel_loss,
+        reverse_use_id_loss=reverse_use_id_loss,
+        reverse_use_local_edge_loss=reverse_use_local_edge_loss,
+        eval_directions=eval_directions,
+        eval_save_p2s_images=eval_save_p2s_images,
         use_bridge_maam=use_bridge_maam,
         bridge_maam_mode=bridge_maam_mode,
         bridge_maam_levels=bridge_maam_levels,
@@ -777,6 +811,12 @@ class LossLoggerCallback(Callback):
                 "local_edge_recon_loss",
                 "local_edge_mask_mean",
 
+                "bilbm_latent_s2p",
+                "bilbm_latent_p2s",
+                "bilbm_total_s2p",
+                "bilbm_total_p2s",
+                "bilbm_reverse_loss_weight",
+
                 # Bridge-aware MAAM logs
                 "bridge_maam_alpha_mean",
                 "bridge_maam_attn_mean",
@@ -842,6 +882,7 @@ class SwanLabEvalCallback(Callback):
             save_images=False,
             save_size=(200, 250),
             save_dir=None,
+            eval_directions: Optional[List[str]] = None,
 
             external_metrics=False,
             external_metrics_steps=(4,),
@@ -869,6 +910,7 @@ class SwanLabEvalCallback(Callback):
         self.save_images = save_images
         self.save_size = tuple(save_size)  # (width, height)
         self.save_dir = save_dir
+        self.eval_directions = eval_directions or ["s2p"]
 
         self.external_metrics = external_metrics
         self.external_metrics_steps = list(external_metrics_steps)
@@ -965,7 +1007,15 @@ class SwanLabEvalCallback(Callback):
         img = (img * 255.0).byte().permute(1, 2, 0).numpy()
         return img
 
-    def _save_generated_images(self, trainer, pred, step_num, batch_idx, keys=None):
+    def _save_generated_images(
+            self,
+            trainer,
+            pred,
+            step_num,
+            batch_idx,
+            keys=None,
+            direction: str = "s2p",
+    ):
         if not self.save_images:
             return None
 
@@ -977,6 +1027,7 @@ class SwanLabEvalCallback(Callback):
             root_dir,
             f"global_step_{trainer.global_step:08d}",
             f"step_{step_num}",
+            direction,
             "generated",
         )
         os.makedirs(gen_dir, exist_ok=True)
@@ -1160,74 +1211,109 @@ class SwanLabEvalCallback(Callback):
                 elif k == "__key__":
                     batch[k] = v
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logs = pl_module.model.log_samples(
-                    batch,
-                    num_steps=self.eval_num_steps,
-                    max_samples=batch["image"].shape[0],
-                )
-
-            src = self._to_01(batch["image"].float())
-            gt = self._to_01(batch["normal"].float())
             keys = batch.get("__key__", None)
 
-            for step_num in self.eval_num_steps:
-                key = f"samples_{step_num}_steps"
-                if key not in logs:
-                    continue
+            for direction in self.eval_directions:
+                if direction == "s2p":
+                    src_pixels = batch[pl_module.model.source_key]
+                    gt_pixels = batch[pl_module.model.target_key]
+                elif direction == "p2s":
+                    src_pixels = batch[pl_module.model.target_key]
+                    gt_pixels = batch[pl_module.model.source_key]
+                else:
+                    raise ValueError(f"Unknown eval direction: {direction}")
 
-                pred = self._to_01(logs[key].float())
+                # 当前第一版 eval_directions=["s2p"]，所以这里只会跑 sketch->photo。
+                # 后面打开 p2s 时，这里会自动改成 photo->sketch。
+                src = self._to_01(src_pixels.float())
+                gt = self._to_01(gt_pixels.float())
 
-                gen_dir = self._save_generated_images(
-                    trainer=trainer,
-                    pred=pred,
-                    step_num=step_num,
-                    batch_idx=batch_idx,
-                    keys=keys,
-                )
+                for step_num in self.eval_num_steps:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        src_for_vae = src_pixels.to(device=device, dtype=torch.bfloat16)
 
-                if gen_dir is not None:
-                    saved_gen_dirs[step_num] = gen_dir
+                        if pl_module.model.vae is not None:
+                            # 保持和 LBMModel.log_samples 原逻辑一致：source resize 到 target 空间大小
+                            src_for_vae = torch.nn.functional.interpolate(
+                                src_for_vae,
+                                size=gt_pixels.shape[2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            ).to(dtype=pl_module.model.dtype)
 
-                # ---------- 计算指标 ----------
-                ssim_val = structural_similarity_index_measure(
-                    pred, gt, data_range=1.0
-                ).item()
+                            z_src = pl_module.model.vae.encode(src_for_vae)
+                        else:
+                            z_src = src_for_vae
 
-                # LPIPS 需要 [-1,1]
-                pred_lp = pred * 2.0 - 1.0
-                gt_lp = gt * 2.0 - 1.0
-                lpips_val = self.lpips_model(pred_lp, gt_lp).mean().item()
+                        pred_raw = pl_module.model.sample(
+                            z_src,
+                            num_steps=step_num,
+                            conditioner_inputs=batch,
+                            max_samples=src_pixels.shape[0],
+                            verbose=False,
+                            direction=direction,
+                        )
 
-                metric_buffers.setdefault(f"eval/ssim_step{step_num}", []).append(ssim_val)
-                metric_buffers.setdefault(f"eval/lpips_step{step_num}", []).append(lpips_val)
+                    pred = self._to_01(pred_raw.float())
 
-                if fid_metrics is not None:
-                    fid_metrics[step_num].update(gt.float(), real=True)
-                    fid_metrics[step_num].update(pred.float(), real=False)
-
-
-                if self.upload_images:
-                    # ---------- 生成拼图 ----------
-                    # 每个样本拼成 [input | generated | gt]
-                    triplets = []
-                    for i in range(src.shape[0]):
-                        triplet = torch.cat([src[i], pred[i], gt[i]], dim=2)  # 横向拼接
-                        triplets.append(triplet)
-
-                    # 再把多个样本纵向排成 grid
-                    grid = make_grid(triplets, nrow=1)
-                    grid_np = self._to_uint8_np(grid)
-
-                    swanlab.log(
-                        {
-                            f"eval/images_step{step_num}_batch{batch_idx}": swanlab.Image(
-                                grid_np,
-                                caption=f"step={step_num} | batch={batch_idx} | input | generated | gt",
-                            )
-                        },
-                        step=trainer.global_step,
+                    gen_dir = self._save_generated_images(
+                        trainer=trainer,
+                        pred=pred,
+                        step_num=step_num,
+                        batch_idx=batch_idx,
+                        keys=keys,
+                        direction=direction,
                     )
+
+                    if gen_dir is not None:
+                        saved_gen_dirs[(direction, step_num)] = gen_dir
+
+                    # ---------- 计算指标 ----------
+                    # 第一版 eval_directions=["s2p"]，所以指标仍然只针对 sketch->photo。
+                    # 如果后面打开 p2s，这里会给 p2s 单独记录 eval/p2s/*。
+                    ssim_val = structural_similarity_index_measure(
+                        pred, gt, data_range=1.0
+                    ).item()
+
+                    pred_lp = pred * 2.0 - 1.0
+                    gt_lp = gt * 2.0 - 1.0
+                    lpips_val = self.lpips_model(pred_lp, gt_lp).mean().item()
+
+                    metric_buffers.setdefault(
+                        f"eval/{direction}/ssim_step{step_num}", []
+                    ).append(ssim_val)
+                    metric_buffers.setdefault(
+                        f"eval/{direction}/lpips_step{step_num}", []
+                    ).append(lpips_val)
+
+                    if fid_metrics is not None:
+                        # 第一版建议 compute_fid=False。
+                        # 如果后面要支持 p2s，最好给不同 direction 分开建 FID metric。
+                        if direction == "s2p":
+                            fid_metrics[step_num].update(gt.float(), real=True)
+                            fid_metrics[step_num].update(pred.float(), real=False)
+
+                    if self.upload_images:
+                        triplets = []
+                        for i in range(src.shape[0]):
+                            triplet = torch.cat([src[i], pred[i], gt[i]], dim=2)
+                            triplets.append(triplet)
+
+                        grid = make_grid(triplets, nrow=1)
+                        grid_np = self._to_uint8_np(grid)
+
+                        swanlab.log(
+                            {
+                                f"eval/{direction}/images_step{step_num}_batch{batch_idx}": swanlab.Image(
+                                    grid_np,
+                                    caption=(
+                                        f"direction={direction} | step={step_num} | "
+                                        f"batch={batch_idx} | input | generated | gt"
+                                    ),
+                                )
+                            },
+                            step=trainer.global_step,
+                        )
 
         # ---------- 记录平均指标 ----------
         final_metrics = {}
@@ -1249,8 +1335,10 @@ class SwanLabEvalCallback(Callback):
                 self.external_metrics
                 and self.eval_counter % self.external_metrics_every_n_evals == 0
         ):
+            # External metrics are kept S2P-only in this first version.
+            # P2S needs a different GT directory and should not use DeepFace/Rank directly.
             for ext_step in self.external_metrics_steps:
-                gen_dir = saved_gen_dirs.get(ext_step, None)
+                gen_dir = saved_gen_dirs.get(("s2p", ext_step), None)
                 self._launch_external_metrics(
                     trainer=trainer,
                     gen_dir=gen_dir,
@@ -1301,6 +1389,16 @@ def main(
     local_edge_dilate_kernel: int = 7,
     local_edge_exclude_labels: List[int] = None,
     local_edge_exclude_dilate_kernel: int = 7,
+    # bidirectional LBM
+    bidirectional: bool = False,
+    bidirectional_mode: str = "none",
+    direction_aware: bool = False,
+    num_directions: int = 2,
+    direction_embed_init: float = 0.0,
+    reverse_loss_weight: float = 0.5,
+    reverse_use_pixel_loss: bool = False,
+    reverse_use_id_loss: bool = False,
+    reverse_use_local_edge_loss: bool = False,
     # bridge-aware MAAM skip refinement
     use_bridge_maam: bool = False,
     bridge_maam_mode: str = "residual",
@@ -1344,6 +1442,8 @@ def main(
     eval_save_images: bool = False,
     eval_save_size: List[int] = [200, 250],
     eval_save_dir: str = None,
+    eval_directions: List[str] = None,
+    eval_save_p2s_images: bool = False,
     eval_external_metrics: bool = False,
     eval_external_metrics_steps: List[int] = [4],
     eval_external_metrics_every_n_evals: int = 1,
@@ -1421,6 +1521,17 @@ def main(
         conditioning_images_keys=conditioning_images_keys,
         conditioning_masks_keys=conditioning_masks_keys,
         bridge_noise_sigma=bridge_noise_sigma,
+        bidirectional=bidirectional,
+        bidirectional_mode=bidirectional_mode,
+        direction_aware=direction_aware,
+        num_directions=num_directions,
+        direction_embed_init=direction_embed_init,
+        reverse_loss_weight=reverse_loss_weight,
+        reverse_use_pixel_loss=reverse_use_pixel_loss,
+        reverse_use_id_loss=reverse_use_id_loss,
+        reverse_use_local_edge_loss=reverse_use_local_edge_loss,
+        eval_directions=eval_directions,
+        eval_save_p2s_images=eval_save_p2s_images,
         #face adapter
         use_face_adapter=use_face_adapter,
         parse_key=parse_key,
@@ -1581,6 +1692,7 @@ def main(
                 save_images=eval_save_images,
                 save_size=eval_save_size,
                 save_dir=eval_save_dir if eval_save_dir is not None else os.path.join(save_ckpt_path, "eval_images"),
+                eval_directions=eval_directions,
 
                 external_metrics=eval_external_metrics,
                 external_metrics_steps=eval_external_metrics_steps,

@@ -34,7 +34,7 @@ direction_embed_init: 0.0
 reverse_loss_weight: 0.5
 
 # 第一版：反向只使用 LBM latent loss，不使用图像级 LPIPS/ID/local edge
-reverse_use_pixel_loss: true
+reverse_use_pixel_loss: false
 reverse_use_id_loss: false
 reverse_use_local_edge_loss: false
 
