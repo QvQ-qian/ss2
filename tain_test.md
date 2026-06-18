@@ -94,7 +94,7 @@ python make_ar_lbm_webdataset.py \
 ```
 ## 训练
 ```.bash
-cd /root/shuqian/projects/LBM-main
+cd /root/shuqian/projects/Bi-LBM
 
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -105,7 +105,7 @@ export SLURM_NNODES=1
 export SLURM_PROCID=0
 export SLURM_JOB_ID=0
 
-CUDA_VISIBLE_DEVICES=2 python examples/training/train_lbm_surface_sd15.py \
+CUDA_VISIBLE_DEVICES=0 python examples/training/train_lbm_surface_sd15.py \
   --path_config examples/training/config/ar_surface_sd15v9_stage1_bilbm_twobridge.yaml
 ```
 ## 1.生成face parsing

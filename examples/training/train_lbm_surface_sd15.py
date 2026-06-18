@@ -1,6 +1,13 @@
 import datetime
 import logging
 import os
+
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+
+import datetime
+import logging
+import os
 import random
 import re
 import shutil
