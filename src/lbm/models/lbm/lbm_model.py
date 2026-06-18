@@ -444,8 +444,22 @@ class LBMModel(BaseModel):
 
         # ------------------------------------------------------------
         # Image-level losses:
-        # first version only applies image losses to S2P.
-        # P2S remains latent-only unless explicitly enabled later.
+        # Balanced Two-Bridge Bi-LBM version.
+        #
+        # S2P: sketch -> photo
+        #   loss_s2p = latent_s2p + pixel_loss_weight * image_loss(pred_photo, gt_photo)
+        #
+        # P2S: photo -> sketch
+        #   loss_p2s = latent_p2s + pixel_loss_weight * image_loss(pred_sketch, gt_sketch)
+        #
+        # When:
+        #   pixel_loss_type = "lpips"
+        #   pixel_loss_weight = 10.0
+        #   reverse_use_pixel_loss = True
+        #   reverse_loss_weight = 1.0
+        #
+        # then both directions use:
+        #   LBM latent loss + 10 * LPIPS
         # ------------------------------------------------------------
         denoised_sample = self._predicted_x_0(
             model_output=prediction,
@@ -456,10 +470,23 @@ class LBMModel(BaseModel):
         denoised_s2p = denoised_sample[:Bsz]
         denoised_p2s = denoised_sample[Bsz:]
 
+        # Logs for old keys
         pixel_loss = self._zero_scalar(device)
         id_recon_loss = self._zero_scalar(device)
         local_edge_recon_loss = self._zero_scalar(device)
 
+        # New Bi-LBM image-level logs
+        pixel_loss_s2p_log = self._zero_scalar(device)
+        pixel_loss_p2s_log = self._zero_scalar(device)
+        id_loss_s2p_log = self._zero_scalar(device)
+        id_loss_p2s_log = self._zero_scalar(device)
+        local_edge_loss_s2p_log = self._zero_scalar(device)
+        local_edge_loss_p2s_log = self._zero_scalar(device)
+
+        # ------------------------------------------------------------
+        # S2P image loss: target is B/photo.
+        # This keeps the original S2P behavior.
+        # ------------------------------------------------------------
         if (
                 self.pixel_loss_weight > 0
                 or self.id_loss_weight > 0
@@ -474,7 +501,6 @@ class LBMModel(BaseModel):
                     )
                 parse_for_local_loss = batch[self.parse_key]
 
-            # S2P image loss: target is B/photo.
             pixel_loss_s2p, id_loss_s2p, local_edge_loss_s2p = self.image_losses(
                 denoised_s2p,
                 pixels_B.detach(),
@@ -484,37 +510,80 @@ class LBMModel(BaseModel):
 
             if self.pixel_loss_weight > 0:
                 loss_s2p = loss_s2p + self.pixel_loss_weight * pixel_loss_s2p
-                pixel_loss = (
+                pixel_loss_s2p_log = (
                     pixel_loss_s2p.mean()
                     if hasattr(pixel_loss_s2p, "mean")
                     else pixel_loss_s2p
                 )
+                # keep old logger key compatible
+                pixel_loss = pixel_loss_s2p_log
 
             if self.id_loss_weight > 0:
                 loss_s2p = loss_s2p + self.id_loss_weight * id_loss_s2p
-                id_recon_loss = (
+                id_loss_s2p_log = (
                     id_loss_s2p.mean()
                     if hasattr(id_loss_s2p, "mean")
                     else id_loss_s2p
                 )
+                # keep old logger key compatible
+                id_recon_loss = id_loss_s2p_log
 
             if self.local_edge_loss_weight > 0:
                 loss_s2p = loss_s2p + self.local_edge_loss_weight * local_edge_loss_s2p
-                local_edge_recon_loss = (
+                local_edge_loss_s2p_log = (
                     local_edge_loss_s2p.mean()
                     if hasattr(local_edge_loss_s2p, "mean")
                     else local_edge_loss_s2p
                 )
+                # keep old logger key compatible
+                local_edge_recon_loss = local_edge_loss_s2p_log
 
-        # Optional reverse image losses are intentionally disabled in v1.
-        if (
-                self.reverse_use_pixel_loss
-                or self.reverse_use_id_loss
-                or self.reverse_use_local_edge_loss
-        ):
+        # ------------------------------------------------------------
+        # P2S image loss: target is A/sketch.
+        # This is the newly enabled reverse pixel-level loss.
+        # It reuses pixel_loss_type and pixel_loss_weight.
+        #
+        # For your current target:
+        #   pixel_loss_type = "lpips"
+        #   pixel_loss_weight = 10.0
+        #   reverse_use_pixel_loss = True
+        #
+        # Then P2S also uses:
+        #   10 * LPIPS(pred_sketch, gt_sketch)
+        # ------------------------------------------------------------
+        if self.reverse_use_pixel_loss:
+            if self.pixel_loss_weight <= 0:
+                raise ValueError(
+                    "reverse_use_pixel_loss=True but pixel_loss_weight <= 0. "
+                    "Set pixel_loss_weight=10.0 if you want P2S to use 10*LPIPS."
+                )
+
+            pixel_loss_p2s, _, _ = self.image_losses(
+                denoised_p2s,
+                pixels_A.detach(),
+                valid_mask,
+                parse=None,
+            )
+
+            loss_p2s = loss_p2s + self.pixel_loss_weight * pixel_loss_p2s
+            pixel_loss_p2s_log = (
+                pixel_loss_p2s.mean()
+                if hasattr(pixel_loss_p2s, "mean")
+                else pixel_loss_p2s
+            )
+
+        # Reverse ID loss is not enabled in this balanced LPIPS experiment.
+        if self.reverse_use_id_loss:
             raise NotImplementedError(
-                "Reverse image losses are not implemented in the first Two-Bridge Bi-LBM version. "
-                "Keep reverse_use_pixel_loss/reverse_use_id_loss/reverse_use_local_edge_loss=False."
+                "reverse_use_id_loss is not implemented yet. "
+                "Keep reverse_use_id_loss=False for this experiment."
+            )
+
+        # Reverse local edge loss is not enabled in this balanced LPIPS experiment.
+        if self.reverse_use_local_edge_loss:
+            raise NotImplementedError(
+                "reverse_use_local_edge_loss is not implemented yet. "
+                "Keep reverse_use_local_edge_loss=False for this experiment."
             )
 
         total_loss = loss_s2p.mean() + self.reverse_loss_weight * loss_p2s.mean()
@@ -547,6 +616,16 @@ class LBMModel(BaseModel):
             # New Bi-LBM logs.
             "bilbm_latent_s2p": latent_s2p.mean(),
             "bilbm_latent_p2s": latent_p2s.mean(),
+
+            # Image-level logs for two directions
+            "bilbm_pixel_s2p": pixel_loss_s2p_log,
+            "bilbm_pixel_p2s": pixel_loss_p2s_log,
+            "bilbm_id_s2p": id_loss_s2p_log,
+            "bilbm_id_p2s": id_loss_p2s_log,
+            "bilbm_local_edge_s2p": local_edge_loss_s2p_log,
+            "bilbm_local_edge_p2s": local_edge_loss_p2s_log,
+
+            # Total direction losses after image-level terms are added
             "bilbm_total_s2p": loss_s2p.mean(),
             "bilbm_total_p2s": loss_p2s.mean(),
             "bilbm_reverse_loss_weight": torch.tensor(

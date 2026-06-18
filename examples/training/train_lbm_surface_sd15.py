@@ -820,6 +820,14 @@ class LossLoggerCallback(Callback):
 
                 "bilbm_latent_s2p",
                 "bilbm_latent_p2s",
+
+                "bilbm_pixel_s2p",
+                "bilbm_pixel_p2s",
+                "bilbm_id_s2p",
+                "bilbm_id_p2s",
+                "bilbm_local_edge_s2p",
+                "bilbm_local_edge_p2s",
+
                 "bilbm_total_s2p",
                 "bilbm_total_p2s",
                 "bilbm_reverse_loss_weight",
