@@ -1,59 +1,61 @@
-#不如v2
-wandb_project: ar-stage1-bilbm-v3-avgloss  #实验名
-save_ckpt_path: /root/storage/shuqian/LBM_out/ar-stage1-bilbm-v3-avgloss #权重保存路径
+wandb_project: ar-stage1-bilbm-v4
+save_ckpt_path: /root/storage/shuqian/LBM_out/ar-stage1-bilbm-v4
 
 train_mode: backbone_only
 log_interval: 125        #隔多久想swanlab记录一次 loss/train  5epoch
 resume_from_checkpoint: false  #是否继续训练
 init_from_checkpoint: null
-max_epochs: 1000
+
+max_epochs: 600
 bridge_noise_sigma: 0.005
-save_interval: 2500   #多久保存一次权重  100epoch
 
-val_check_interval: 250  #多久进行一次评估  10epoch
-limit_val_batches: 6  #总共跑几个 batch
+save_interval: 2500
+val_check_interval: 250
+limit_val_batches: 6
 
-eval_num_steps: [1, 2, 4]  #评估时要采样的步数
-eval_max_batches: 6    #每次评估用几个 validation batch
-eval_max_samples: 4    #每个评估 batch 里最多取几张图用于生成图像和计算指标
-eval_upload_images: false # 是否上传评估拼图
-
-eval_compute_fid: false #是否计算fid
+eval_num_steps: [1, 2, 4]
+eval_max_batches: 6
+eval_max_samples: 4
+eval_upload_images: false
+eval_compute_fid: false
 
 # =========================
 # Bi-LBM: two-bridge direction-aware training
 # =========================
 bidirectional: true
 bidirectional_mode: "two_bridge"
-
 direction_aware: true
 num_directions: 2
 direction_embed_init: 0.0
 
-# 0: source_key -> target_key, i.e. image/sketch -> normal/photo
-# 1: target_key -> source_key, i.e. normal/photo -> image/sketch
+# direction_id = 0:
+# image/sketch -> normal/photo
+#
+# direction_id = 1:
+# normal/photo -> image/sketch
 reverse_loss_weight: 1.0
 
-# 第一版：反向只使用 LBM latent loss，不使用图像级 LPIPS/ID/local edge
+# Balanced bidirectional image-level loss:
+# S2P: latent loss + 10 * LPIPS
+# P2S: latent loss + 10 * LPIPS
 reverse_use_pixel_loss: true
 reverse_use_id_loss: false
 reverse_use_local_edge_loss: false
 
-# 验证阶段第一版只生成 sketch->photo，避免保存/指标逻辑复杂化
-eval_directions: ["s2p","p2s"]
-eval_save_p2s_images: false
-
-
+# Evaluation directions
+eval_directions: ["s2p", "p2s"]
+eval_save_p2s_images: true
 
 # ---------- Bridge-aware SCSA-MAAM Skip Refinement ----------
 use_bridge_maam: false
 
 # residual: E' = E + alpha * (F - E)
-# direct:   E' = F
+# direct: E' = F
 bridge_maam_mode: residual
 
-# first version: only high-resolution skip    high mid all
-bridge_maam_levels: ["high"]  # high的效果比all好
+# first version: only high-resolution skip
+# options: high / mid / all
+bridge_maam_levels: ["high"]
 
 # use SCSA instead of original CBAM-style CA/SA
 bridge_maam_attn_type: scsa
@@ -71,39 +73,60 @@ bridge_maam_scsa_groups: 4
 bridge_maam_scsa_kernels: [3, 5, 7, 9]
 bridge_maam_scsa_pool_size: 7
 
-# 评估时保存图片
-eval_save_images: true  #是否保存
+# =========================
+# Save validation images
+# =========================
+eval_save_images: true
 eval_save_size: [200, 250]   # [width, height]
-eval_save_dir: null          # 不写则默认保存到 save_ckpt_path/eval_images
+eval_save_dir: null          # null -> save_ckpt_path/eval_images
 
-#训练中评估在256×256 空间里算的
+# =========================
+# External metrics
+# =========================
+eval_external_metrics: true
 
-# 外部指标计算
-eval_external_metrics: false
-eval_external_metrics_steps: [1,4]  #只计算4步生成的
-eval_external_metrics_every_n_evals: 1   # 每次评估都算；可改成2、3降低频率
-eval_external_metrics_device: cpu        # 推荐 cpu，避免和训练抢GPU cpu cuda  cuda:0
+# Only calculate external metrics for 1-step and 4-step generations
+eval_external_metrics_steps: [1, 4]
+eval_external_metrics_every_n_evals: 1
+eval_external_metrics_device: cpu
 eval_external_metrics_batch_size: 8
 
-# GT 原图文件夹
+# Direction-aware metric calculation
+eval_external_metrics_directions: ["s2p", "p2s"]
+
+# s2p: generated photo vs real photo
+eval_gt_dir_s2p: /root/shuqian/dataset/AR_LBM_raw/test_B
+
+# p2s: generated sketch vs real sketch
+eval_gt_dir_p2s: /root/shuqian/dataset/AR_LBM_raw/test_A
+
+# s2p calculates ALL + rank_new
+eval_external_image_metrics_s2p: true
+eval_external_rank_metrics_s2p: true
+
+# p2s calculates ALL only, no rank_new
+eval_external_image_metrics_p2s: true
+eval_external_rank_metrics_p2s: false
+
+# Old global fields, kept for compatibility with existing code
 eval_gt_dir: /root/shuqian/dataset/AR_LBM_raw/test_B
+eval_external_image_metrics: true
+eval_external_rank_metrics: true
 
-# 选择要算什么
-eval_external_image_metrics: false   #ALL
-eval_external_rank_metrics: false    #rank_new
-
-# 权重缓存路径
+# Cache / local checkpoints for external metrics
 eval_external_deepface_home: /root/shuqian/checkpoints
 eval_external_inception_v3_path: /root/shuqian/checkpoints/inception_v3_google-0cc3c7bd.pth
 
-# 外部指标脚本
+# External metrics script
 eval_external_metrics_script: tools/calc_external_metrics.py
-
 eval_external_metrics_wait_on_fit_end: true
-eval_external_metrics_wait_timeout: 1800   #训练结束后等待时间  30min
+eval_external_metrics_wait_timeout: 1800
 eval_external_metrics_poll_interval: 5
 
-backbone_signature: /root/dataset/weights/stable-diffusion-v1-5-min  #sd15权重路径
+# =========================
+# Backbone / data
+# =========================
+backbone_signature: /root/dataset/weights/stable-diffusion-v1-5-min
 
 train_shards:
   - /root/shuqian/dataset/AR_LBM_wds/ar_train-{000000..000000}.tar
@@ -120,40 +143,43 @@ learning_rate: 5.0e-5
 optimizer: AdamW
 
 num_steps: [1, 2, 4]
-
-timestep_sampling: uniform   #均匀分布  也可以使用离散分布（可能会更好）
+timestep_sampling: uniform
 
 unet_input_channels: 4
 vae_num_channels: 4
 
+# =========================
+# Losses
+# =========================
 pixel_loss_type: lpips
 pixel_loss_weight: 10.0
 
 latent_loss_type: l2
 latent_loss_weight: 1.0
 
-# 新增局部边缘损失：第一版只约束 eye
-local_edge_loss_weight: 0.0   # 显著提升fid mssim vif 从0.05---》0.5
+# Local edge loss, currently disabled
+local_edge_loss_weight: 0.0
 local_edge_parts: ["eye"]
 local_edge_dilate_kernel: 7
-# 戴眼镜样本稳定性：排除 eye_glass=6
+
+# Exclude eyeglasses label = 6
 local_edge_exclude_labels: [6]
 local_edge_exclude_dilate_kernel: 7
 
-
-#或者可以微调
-#1.先用你之前效果最好的 无 ID loss 模型 作为初始化；
-#2.再用小 ID loss 微调；
-#3.学习率降低。
-# V1 先关闭 ID loss，避免变量混杂
-id_loss_weight: 0.0   # 设置0.02~0.05之间，太大会降低除人脸识别外的指标  0.02 0.03（值得尝试）
+# ID loss, currently disabled
+id_loss_weight: 0.0
 id_loss_model_path: /root/shuqian/checkpoints/model_ir_se50.pth
 id_loss_crop: false
 
+# =========================
+# Conditioning
+# =========================
 conditioning_images_keys: []
 conditioning_masks_keys: []
 
-# ---------- Face Parsing Adapter V1 ----------
+# =========================
+# Face Parsing Adapter V1
+# =========================
 use_face_adapter: false
 parse_key: parse
 parse_num_classes: 19
@@ -162,11 +188,13 @@ parse_adapter_condition_dropout: 0.0
 parse_adapter_include_mid: false
 parse_adapter_zero_init: true
 
-# 未来 coarse face 预留，V1 关闭
+# Future coarse face adapter, disabled in V1
 use_coarse_face_adapter: false
 coarse_face_key: null
 
-# ---------- VAE encoder-decoder skip ----------
+# =========================
+# VAE encoder-decoder skip
+# =========================
 use_vae_skip: false
 vae_skip_zero_init: true
 vae_skip_gamma: 1.0

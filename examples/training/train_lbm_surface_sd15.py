@@ -913,6 +913,14 @@ class SwanLabEvalCallback(Callback):
             external_metrics_wait_on_fit_end=True,
             external_metrics_wait_timeout=600,
             external_metrics_poll_interval=5,
+
+            external_metrics_directions: Optional[List[str]] = None,
+            external_gt_dir_s2p: Optional[str] = None,
+            external_gt_dir_p2s: Optional[str] = None,
+            external_image_metrics_s2p: bool = True,
+            external_rank_metrics_s2p: bool = True,
+            external_image_metrics_p2s: bool = True,
+            external_rank_metrics_p2s: bool = False,
     ):
         super().__init__()
         self.eval_num_steps = list(eval_num_steps)
@@ -939,12 +947,34 @@ class SwanLabEvalCallback(Callback):
         self.external_inception_v3_path = external_inception_v3_path
         self.external_metrics_script = external_metrics_script
 
+        self.external_metrics_directions = external_metrics_directions
+        self.external_gt_dir_s2p = external_gt_dir_s2p
+        self.external_gt_dir_p2s = external_gt_dir_p2s
+        self.external_image_metrics_s2p = external_image_metrics_s2p
+        self.external_rank_metrics_s2p = external_rank_metrics_s2p
+        self.external_image_metrics_p2s = external_image_metrics_p2s
+        self.external_rank_metrics_p2s = external_rank_metrics_p2s
+
         self.eval_counter = 0
         self.pending_metric_jsons = {}
 
         self.external_metrics_wait_on_fit_end = external_metrics_wait_on_fit_end
         self.external_metrics_wait_timeout = int(external_metrics_wait_timeout)
         self.external_metrics_poll_interval = int(external_metrics_poll_interval)
+
+    def _get_external_gt_dir_for_direction(self, direction: str):
+        if direction == "s2p":
+            return self.external_gt_dir_s2p or self.external_gt_dir
+        if direction == "p2s":
+            return self.external_gt_dir_p2s
+        raise ValueError(f"Unknown direction for external metrics: {direction}")
+
+    def _get_external_metric_flags_for_direction(self, direction: str):
+        if direction == "s2p":
+            return self.external_image_metrics_s2p, self.external_rank_metrics_s2p
+        if direction == "p2s":
+            return self.external_image_metrics_p2s, self.external_rank_metrics_p2s
+        raise ValueError(f"Unknown direction for external metrics: {direction}")
 
     def setup(self, trainer, pl_module, stage=None):
         if self.lpips_model is None:
@@ -1086,13 +1116,65 @@ class SwanLabEvalCallback(Callback):
 
             try:
                 with open(json_path, "r") as f:
-                    metrics = json.load(f)
+                    raw_metrics = json.load(f)
 
-                metrics = {
-                    k: float(v)
-                    for k, v in metrics.items()
-                    if isinstance(v, (int, float))
-                }
+                # ------------------------------------------------------------
+                # Infer direction from json path.
+                # Current _launch_external_metrics saves json as:
+                #   .../external_metrics/s2p/metrics_global_step_xxx_s2p_step_1.json
+                #   .../external_metrics/p2s/metrics_global_step_xxx_p2s_step_1.json
+                # ------------------------------------------------------------
+                direction = None
+                norm_path = os.path.normpath(json_path)
+                path_parts = norm_path.split(os.sep)
+
+                if "external_metrics" in path_parts:
+                    idx = path_parts.index("external_metrics")
+                    if idx + 1 < len(path_parts):
+                        maybe_direction = path_parts[idx + 1]
+                        if maybe_direction in ["s2p", "p2s"]:
+                            direction = maybe_direction
+
+                if direction is None:
+                    base = os.path.basename(json_path)
+                    if "_s2p_" in base or base.startswith("s2p_"):
+                        direction = "s2p"
+                    elif "_p2s_" in base or base.startswith("p2s_"):
+                        direction = "p2s"
+
+                # Fallback: old behavior
+                if direction is None:
+                    direction = "unknown"
+
+                # ------------------------------------------------------------
+                # Keep numeric metrics only and add direction prefix.
+                #
+                # Example:
+                #   external/fid_step1 -> external/s2p/fid_step1
+                #   external/rank1_step1 -> external/s2p/rank1_step1
+                #
+                # If a key is already prefixed, keep it unchanged.
+                # ------------------------------------------------------------
+                metrics = {}
+                for k, v in raw_metrics.items():
+                    if not isinstance(v, (int, float)):
+                        continue
+
+                    v = float(v)
+
+                    if direction in ["s2p", "p2s"]:
+                        prefix = f"external/{direction}/"
+
+                        if k.startswith(prefix):
+                            new_key = k
+                        elif k.startswith("external/"):
+                            new_key = k.replace("external/", prefix, 1)
+                        else:
+                            new_key = prefix + k
+                    else:
+                        new_key = k
+
+                    metrics[new_key] = v
 
                 if len(metrics) > 0:
                     self._log_metrics(trainer, metrics, step=metric_step)
@@ -1102,7 +1184,10 @@ class SwanLabEvalCallback(Callback):
                     except Exception as e:
                         print(f"[ExternalMetrics] swanlab.log failed: {repr(e)}")
 
-                    print(f"[ExternalMetrics] logged at step={metric_step}: {metrics}")
+                    print(
+                        f"[ExternalMetrics] logged direction={direction} "
+                        f"at step={metric_step}: {metrics}"
+                    )
 
                 finished.append(json_path)
 
@@ -1112,34 +1197,115 @@ class SwanLabEvalCallback(Callback):
         for p in finished:
             self.pending_metric_jsons.pop(p, None)
 
-    def _launch_external_metrics(self, trainer, gen_dir, step_num):
+    def _launch_external_metrics(
+            self,
+            trainer,
+            gen_dir,
+            step_num,
+            direction="s2p",
+            gt_dir=None,
+            do_image_metrics=None,
+            do_rank_metrics=None,
+    ):
         if not self.external_metrics:
             return
 
         if step_num not in self.external_metrics_steps:
             return
 
-        if self.external_gt_dir is None:
-            print("[ExternalMetrics] external_gt_dir is None, skip.")
+        # ------------------------------------------------------------
+        # Direction-aware gt_dir selection
+        # ------------------------------------------------------------
+        if gt_dir is None:
+            if direction == "s2p":
+                # s2p: generated photo should compare with real photo
+                gt_dir = getattr(self, "external_gt_dir_s2p", None)
+                if gt_dir is None:
+                    gt_dir = self.external_gt_dir
+            elif direction == "p2s":
+                # p2s: generated sketch should compare with real sketch
+                gt_dir = getattr(self, "external_gt_dir_p2s", None)
+            else:
+                print(f"[ExternalMetrics] unknown direction={direction}, skip.")
+                return
+
+        if gt_dir is None:
+            print(
+                f"[ExternalMetrics] gt_dir is None, skip. "
+                f"direction={direction}, step={step_num}"
+            )
+            return
+
+        if not os.path.isdir(gt_dir):
+            print(
+                f"[ExternalMetrics] invalid gt_dir, skip. "
+                f"direction={direction}, step={step_num}, gt_dir={gt_dir}"
+            )
             return
 
         if gen_dir is None or not os.path.isdir(gen_dir):
-            print(f"[ExternalMetrics] invalid gen_dir for step={step_num}: {gen_dir}")
+            print(
+                f"[ExternalMetrics] invalid gen_dir, skip. "
+                f"direction={direction}, step={step_num}, gen_dir={gen_dir}"
+            )
+            return
+
+        # ------------------------------------------------------------
+        # Direction-aware metric flags
+        # ------------------------------------------------------------
+        if do_image_metrics is None:
+            if direction == "s2p":
+                do_image_metrics = getattr(
+                    self,
+                    "external_image_metrics_s2p",
+                    self.external_image_metrics,
+                )
+            elif direction == "p2s":
+                do_image_metrics = getattr(
+                    self,
+                    "external_image_metrics_p2s",
+                    self.external_image_metrics,
+                )
+            else:
+                do_image_metrics = self.external_image_metrics
+
+        if do_rank_metrics is None:
+            if direction == "s2p":
+                do_rank_metrics = getattr(
+                    self,
+                    "external_rank_metrics_s2p",
+                    self.external_rank_metrics,
+                )
+            elif direction == "p2s":
+                do_rank_metrics = getattr(
+                    self,
+                    "external_rank_metrics_p2s",
+                    False,
+                )
+            else:
+                do_rank_metrics = self.external_rank_metrics
+
+        if not do_image_metrics and not do_rank_metrics:
+            print(
+                f"[ExternalMetrics] both image/rank metrics disabled, skip. "
+                f"direction={direction}, step={step_num}"
+            )
             return
 
         root_dir = self.save_dir
         if root_dir is None:
             root_dir = os.path.join(trainer.default_root_dir, "eval_images")
 
-        metrics_dir = os.path.join(root_dir, "external_metrics")
+        # Separate direction folders to avoid json/log overwrite
+        metrics_dir = os.path.join(root_dir, "external_metrics", direction)
         os.makedirs(metrics_dir, exist_ok=True)
 
         out_json = os.path.join(
             metrics_dir,
-            f"metrics_global_step_{trainer.global_step:08d}_step_{step_num}.json",
+            f"metrics_global_step_{trainer.global_step:08d}_{direction}_step_{step_num}.json",
         )
 
-        # 只避免同一个 json 重复启动，不再阻止 step1 和 step4 同时启动
+        # 只避免同一个 json 重复启动，不阻止 step1/step4 或 s2p/p2s 同时启动
         if out_json in self.pending_metric_jsons:
             print(f"[ExternalMetrics] task already pending, skip: {out_json}")
             return
@@ -1147,20 +1313,20 @@ class SwanLabEvalCallback(Callback):
         cmd = [
             sys.executable,
             self.external_metrics_script,
-            "--gt_dir", self.external_gt_dir,
-            "--gen_dir", gen_dir,
-            "--out_json", out_json,
-            "--device", self.external_metrics_device,
+            "--gt_dir", str(gt_dir),
+            "--gen_dir", str(gen_dir),
+            "--out_json", str(out_json),
+            "--device", str(self.external_metrics_device),
             "--batch_size", str(self.external_metrics_batch_size),
-            "--deepface_home", self.external_deepface_home,
-            "--local_inception_v3_path", self.external_inception_v3_path,
+            "--deepface_home", str(self.external_deepface_home),
+            "--local_inception_v3_path", str(self.external_inception_v3_path),
             "--step_num", str(step_num),
         ]
 
-        if self.external_image_metrics:
+        if do_image_metrics:
             cmd.append("--do_image_metrics")
 
-        if self.external_rank_metrics:
+        if do_rank_metrics:
             cmd.append("--do_rank_metrics")
 
         env = os.environ.copy()
@@ -1170,10 +1336,15 @@ class SwanLabEvalCallback(Callback):
 
         log_path = out_json + ".log"
 
-        print(f"[ExternalMetrics] launch step={step_num}: {' '.join(cmd)}")
-        print(f"[ExternalMetrics] gen_dir step={step_num}: {gen_dir}")
-        print(f"[ExternalMetrics] out_json step={step_num}: {out_json}")
-        print(f"[ExternalMetrics] log step={step_num}: {log_path}")
+        print(
+            f"[ExternalMetrics] launch direction={direction}, step={step_num}, "
+            f"image_metrics={do_image_metrics}, rank_metrics={do_rank_metrics}: "
+            f"{' '.join(cmd)}"
+        )
+        print(f"[ExternalMetrics] gt_dir direction={direction}, step={step_num}: {gt_dir}")
+        print(f"[ExternalMetrics] gen_dir direction={direction}, step={step_num}: {gen_dir}")
+        print(f"[ExternalMetrics] out_json direction={direction}, step={step_num}: {out_json}")
+        print(f"[ExternalMetrics] log direction={direction}, step={step_num}: {log_path}")
 
         with open(log_path, "w") as log_f:
             subprocess.Popen(
@@ -1352,13 +1523,43 @@ class SwanLabEvalCallback(Callback):
         ):
             # External metrics are kept S2P-only in this first version.
             # P2S needs a different GT directory and should not use DeepFace/Rank directly.
-            for ext_step in self.external_metrics_steps:
-                gen_dir = saved_gen_dirs.get(("s2p", ext_step), None)
-                self._launch_external_metrics(
-                    trainer=trainer,
-                    gen_dir=gen_dir,
-                    step_num=ext_step,
-                )
+            if self.external_metrics:
+                metrics_directions = self.external_metrics_directions or ["s2p"]
+
+                for direction in metrics_directions:
+                    gt_dir = self._get_external_gt_dir_for_direction(direction)
+                    do_image_metrics, do_rank_metrics = self._get_external_metric_flags_for_direction(direction)
+
+                    if gt_dir is None:
+                        print(f"[ExternalMetrics] skip direction={direction}: gt_dir is None")
+                        continue
+
+                    if not do_image_metrics and not do_rank_metrics:
+                        print(f"[ExternalMetrics] skip direction={direction}: both image/rank metrics disabled")
+                        continue
+
+                    for ext_step in self.external_metrics_steps:
+                        gen_dir = saved_gen_dirs.get((direction, ext_step), None)
+
+                        if gen_dir is None:
+                            print(
+                                f"[ExternalMetrics] skip direction={direction}, step={ext_step}: "
+                                f"generated dir not found in saved_gen_dirs"
+                            )
+                            continue
+
+                        metrics = self._launch_external_metrics(
+                            trainer=trainer,
+                            gen_dir=gen_dir,
+                            step_num=ext_step,
+                            direction=direction,
+                            gt_dir=gt_dir,
+                            do_image_metrics=do_image_metrics,
+                            do_rank_metrics=do_rank_metrics,
+                        )
+
+                        if metrics is not None and len(metrics) > 0:
+                            final_metrics.update(metrics)
 
         if len(final_metrics) > 0:
             self._log_metrics(trainer, final_metrics)
@@ -1464,9 +1665,20 @@ def main(
     eval_external_metrics_every_n_evals: int = 1,
     eval_external_metrics_device: str = "cpu",
     eval_external_metrics_batch_size: int = 8,
+
+    # old global fields, kept for compatibility
     eval_gt_dir: str = None,
     eval_external_image_metrics: bool = True,
     eval_external_rank_metrics: bool = True,
+
+    # new direction-aware external metrics fields
+    eval_external_metrics_directions: List[str] = None,
+    eval_gt_dir_s2p: str = None,
+    eval_gt_dir_p2s: str = None,
+    eval_external_image_metrics_s2p: bool = True,
+    eval_external_rank_metrics_s2p: bool = True,
+    eval_external_image_metrics_p2s: bool = True,
+    eval_external_rank_metrics_p2s: bool = False,
     eval_external_deepface_home: str = "/root/shuqian/checkpoints",
     eval_external_inception_v3_path: str = "/root/shuqian/checkpoints/inception_v3_google-0cc3c7bd.pth",
     eval_external_metrics_script: str = "tools/calc_external_metrics.py",
@@ -1714,9 +1926,21 @@ def main(
                 external_metrics_every_n_evals=eval_external_metrics_every_n_evals,
                 external_metrics_device=eval_external_metrics_device,
                 external_metrics_batch_size=eval_external_metrics_batch_size,
+
+                # old global fields
                 external_gt_dir=eval_gt_dir,
                 external_image_metrics=eval_external_image_metrics,
                 external_rank_metrics=eval_external_rank_metrics,
+
+                # new direction-aware fields
+                external_metrics_directions=eval_external_metrics_directions,
+                external_gt_dir_s2p=eval_gt_dir_s2p,
+                external_gt_dir_p2s=eval_gt_dir_p2s,
+                external_image_metrics_s2p=eval_external_image_metrics_s2p,
+                external_rank_metrics_s2p=eval_external_rank_metrics_s2p,
+                external_image_metrics_p2s=eval_external_image_metrics_p2s,
+                external_rank_metrics_p2s=eval_external_rank_metrics_p2s,
+
                 external_deepface_home=eval_external_deepface_home,
                 external_inception_v3_path=eval_external_inception_v3_path,
                 external_metrics_script=eval_external_metrics_script,
