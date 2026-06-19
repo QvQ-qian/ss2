@@ -1,5 +1,5 @@
-wandb_project: ar-stage1-bilbm-v4
-save_ckpt_path: /root/storage/shuqian/LBM_out/ar-stage1-bilbm-v4
+wandb_project: ar-bilbm-detail
+save_ckpt_path: /root/storage/shuqian/LBM_out/ar-bilbm-detail
 
 train_mode: backbone_only
 log_interval: 125        #隔多久想swanlab记录一次 loss/train  5epoch
@@ -87,8 +87,9 @@ eval_external_metrics: true
 
 # Only calculate external metrics for 1-step and 4-step generations
 eval_external_metrics_steps: [1, 4]
-eval_external_metrics_every_n_evals: 1
-eval_external_metrics_device: cpu
+eval_external_metrics_every_n_evals: 3
+eval_external_metrics_device: cuda:0   # cpu cuda
+eval_external_metrics_cuda_visible_devices: "1"  #计算外部指标用的gpu
 eval_external_metrics_batch_size: 8
 
 # Direction-aware metric calculation
@@ -120,8 +121,9 @@ eval_external_inception_v3_path: /root/shuqian/checkpoints/inception_v3_google-0
 # External metrics script
 eval_external_metrics_script: tools/calc_external_metrics.py
 eval_external_metrics_wait_on_fit_end: true
-eval_external_metrics_wait_timeout: 1800
-eval_external_metrics_poll_interval: 5
+# <= 0 表示无限等待，直到 pending_metric_jsons 全部完成并上传
+eval_external_metrics_wait_timeout: 21600   # 6小时
+eval_external_metrics_poll_interval: 10
 
 # =========================
 # Backbone / data

@@ -904,6 +904,7 @@ class SwanLabEvalCallback(Callback):
             external_metrics_every_n_evals=1,
             external_metrics_device="cpu",
             external_metrics_batch_size=8,
+            external_metrics_cuda_visible_devices: Optional[str] = None,
             external_gt_dir=None,
             external_image_metrics=True,
             external_rank_metrics=True,
@@ -913,6 +914,7 @@ class SwanLabEvalCallback(Callback):
             external_metrics_wait_on_fit_end=True,
             external_metrics_wait_timeout=600,
             external_metrics_poll_interval=5,
+
 
             external_metrics_directions: Optional[List[str]] = None,
             external_gt_dir_s2p: Optional[str] = None,
@@ -946,6 +948,7 @@ class SwanLabEvalCallback(Callback):
         self.external_deepface_home = external_deepface_home
         self.external_inception_v3_path = external_inception_v3_path
         self.external_metrics_script = external_metrics_script
+        self.external_metrics_cuda_visible_devices = external_metrics_cuda_visible_devices
 
         self.external_metrics_directions = external_metrics_directions
         self.external_gt_dir_s2p = external_gt_dir_s2p
@@ -1008,32 +1011,81 @@ class SwanLabEvalCallback(Callback):
             self._try_log_finished_external_metrics(trainer)
 
     def _wait_and_log_finished_external_metrics(self, trainer):
+        """
+        Wait for all pending external metric json files and log them to SwanLab.
+
+        If external_metrics_wait_timeout > 0:
+            wait at most this many seconds.
+
+        If external_metrics_wait_timeout <= 0:
+            wait forever until all pending json files are generated and logged.
+
+        This makes external metrics automatically uploaded even after the main
+        training loop has finished, as long as this Python process is still alive.
+        """
         if not getattr(self, "pending_metric_jsons", None):
             return
 
         if not self.external_metrics_wait_on_fit_end:
+            print(
+                "[ExternalMetrics] external_metrics_wait_on_fit_end=False, "
+                "only try logging finished jsons once."
+            )
             self._try_log_finished_external_metrics(trainer)
             return
 
-        deadline = time.time() + self.external_metrics_wait_timeout
+        timeout = int(self.external_metrics_wait_timeout)
 
-        while self.pending_metric_jsons and time.time() < deadline:
+        if timeout > 0:
+            deadline = time.time() + timeout
+            print(
+                f"[ExternalMetrics] wait for pending external metrics, "
+                f"timeout={timeout}s, pending={len(self.pending_metric_jsons)}"
+            )
+        else:
+            deadline = None
+            print(
+                f"[ExternalMetrics] wait for pending external metrics until all finish, "
+                f"timeout=unlimited, pending={len(self.pending_metric_jsons)}"
+            )
+
+        last_pending_count = len(self.pending_metric_jsons)
+
+        while self.pending_metric_jsons:
+            # Try to read and log json files that have already been generated.
             self._try_log_finished_external_metrics(trainer)
 
             if not self.pending_metric_jsons:
+                print("[ExternalMetrics] all pending external metrics have been logged.")
                 break
+
+            # Timeout only works when external_metrics_wait_timeout > 0.
+            if deadline is not None and time.time() >= deadline:
+                print(
+                    "[ExternalMetrics] wait timeout reached. "
+                    f"Unlogged pending jsons: {list(self.pending_metric_jsons.keys())}"
+                )
+                break
+
+            current_pending_count = len(self.pending_metric_jsons)
+
+            if current_pending_count != last_pending_count:
+                print(
+                    f"[ExternalMetrics] pending reduced: "
+                    f"{last_pending_count} -> {current_pending_count}"
+                )
+                last_pending_count = current_pending_count
 
             print(
                 f"[ExternalMetrics] waiting for {len(self.pending_metric_jsons)} "
                 f"external metric task(s) to finish..."
             )
+
             time.sleep(self.external_metrics_poll_interval)
 
-        if self.pending_metric_jsons:
-            print(
-                "[ExternalMetrics] some metric tasks were not logged before timeout: "
-                f"{list(self.pending_metric_jsons.keys())}"
-            )
+        # One final try before leaving.
+        self._try_log_finished_external_metrics(trainer)
+
 
     def on_fit_end(self, trainer, pl_module):
         if trainer.is_global_zero:
@@ -1310,13 +1362,50 @@ class SwanLabEvalCallback(Callback):
             print(f"[ExternalMetrics] task already pending, skip: {out_json}")
             return
 
+        # ------------------------------------------------------------
+        # Decide device and visible CUDA devices for the external metric
+        # child process.
+        #
+        # Example:
+        #   external_metrics_device = "cuda:0"
+        #   external_metrics_cuda_visible_devices = "3"
+        #
+        # Then the child process only sees physical GPU 3, and inside the
+        # child process it is mapped to cuda:0.
+        # ------------------------------------------------------------
+        metric_device = str(self.external_metrics_device)
+        env = os.environ.copy()
+
+        if metric_device.lower() == "cpu":
+            env["CUDA_VISIBLE_DEVICES"] = ""
+            metric_device_for_child = "cpu"
+        else:
+            visible_devices = getattr(
+                self,
+                "external_metrics_cuda_visible_devices",
+                None,
+            )
+
+            if visible_devices is not None and str(visible_devices).strip() != "":
+                env["CUDA_VISIBLE_DEVICES"] = str(visible_devices)
+
+                # After CUDA_VISIBLE_DEVICES is set, the selected physical GPU(s)
+                # are remapped inside the child process. Therefore, use cuda:0.
+                if metric_device.startswith("cuda"):
+                    metric_device_for_child = "cuda:0"
+                else:
+                    metric_device_for_child = metric_device
+            else:
+                # Use the same CUDA_VISIBLE_DEVICES environment as the training process.
+                metric_device_for_child = metric_device
+
         cmd = [
             sys.executable,
             self.external_metrics_script,
             "--gt_dir", str(gt_dir),
             "--gen_dir", str(gen_dir),
             "--out_json", str(out_json),
-            "--device", str(self.external_metrics_device),
+            "--device", str(metric_device_for_child),
             "--batch_size", str(self.external_metrics_batch_size),
             "--deepface_home", str(self.external_deepface_home),
             "--local_inception_v3_path", str(self.external_inception_v3_path),
@@ -1329,11 +1418,6 @@ class SwanLabEvalCallback(Callback):
         if do_rank_metrics:
             cmd.append("--do_rank_metrics")
 
-        env = os.environ.copy()
-
-        if str(self.external_metrics_device).lower() == "cpu":
-            env["CUDA_VISIBLE_DEVICES"] = ""
-
         log_path = out_json + ".log"
 
         print(
@@ -1345,6 +1429,10 @@ class SwanLabEvalCallback(Callback):
         print(f"[ExternalMetrics] gen_dir direction={direction}, step={step_num}: {gen_dir}")
         print(f"[ExternalMetrics] out_json direction={direction}, step={step_num}: {out_json}")
         print(f"[ExternalMetrics] log direction={direction}, step={step_num}: {log_path}")
+        print(
+            f"[ExternalMetrics] device={metric_device_for_child}, "
+            f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', os.environ.get('CUDA_VISIBLE_DEVICES', None))}"
+        )
 
         with open(log_path, "w") as log_f:
             subprocess.Popen(
@@ -1665,6 +1753,8 @@ def main(
     eval_external_metrics_every_n_evals: int = 1,
     eval_external_metrics_device: str = "cpu",
     eval_external_metrics_batch_size: int = 8,
+    eval_external_metrics_cuda_visible_devices: str = None,
+
 
     # old global fields, kept for compatibility
     eval_gt_dir: str = None,
@@ -1947,6 +2037,7 @@ def main(
                 external_metrics_wait_on_fit_end=eval_external_metrics_wait_on_fit_end,
                 external_metrics_wait_timeout=eval_external_metrics_wait_timeout,
                 external_metrics_poll_interval=eval_external_metrics_poll_interval,
+                external_metrics_cuda_visible_devices=eval_external_metrics_cuda_visible_devices,
             ),
             LearningRateMonitor(logging_interval="step"),
             ModelCheckpoint(
