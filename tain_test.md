@@ -62,6 +62,7 @@ python infer_ar_sd15.py \
 ```
 tmux new -s lbm-5-5
 tmux attach -t lbm-5-5
+tmux attach -t bi-lbm-6-18
 exit
 
 ## 打包
@@ -105,8 +106,8 @@ export SLURM_NNODES=1
 export SLURM_PROCID=0
 export SLURM_JOB_ID=0
 
-CUDA_VISIBLE_DEVICES=0 python examples/training/train_lbm_surface_sd15.py \
-  --path_config examples/training/config/ar_surface_bilbm_twobridge_v2.yaml
+CUDA_VISIBLE_DEVICES=2 python examples/training/train_lbm_surface_sd15.py \
+  --path_config examples/training/config/ar_surface_bilbm_twobridge_v3.yaml
 ```
 ## 1.生成face parsing
 ### 生成训练集 parsing
