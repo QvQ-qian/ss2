@@ -11,7 +11,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import ALL
-import rank_new
 
 
 def safe_float(x, default=0.0):
@@ -79,21 +78,21 @@ def main():
         )
 
     if args.do_rank_metrics:
-        face_metrics = rank_new.calculate(
-            gallery=args.gt_dir,
-            probe=args.gen_dir,
-        )
+        try:
+            import rank_new
 
-        metrics.update(
-            {
-                f"external/rank1_step{step}": safe_float(
-                    face_metrics.get("rank_1_accuracy", 0)
-                ),
-                f"external/rank5_step{step}": safe_float(
-                    face_metrics.get("rank_5_accuracy", 0)
-                ),
-            }
-        )
+            rank_metrics = rank_new.calculate(
+                gt_dir=args.gt_dir,
+                gen_dir=args.gen_dir,
+            )
+
+            for k, v in rank_metrics.items():
+                if isinstance(v, (int, float)):
+                    metrics[f"external/{k}_step{args.step_num}"] = float(v)
+
+        except Exception as e:
+            print(f"[ExternalMetrics] rank_new failed: {repr(e)}")
+            metrics[f"external/rank_failed_step{args.step_num}"] = 1.0
 
     os.makedirs(os.path.dirname(args.out_json), exist_ok=True)
 

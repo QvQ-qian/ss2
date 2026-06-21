@@ -1,5 +1,5 @@
-wandb_project: ar-bilbm-detail
-save_ckpt_path: /root/storage/shuqian/LBM_out/ar-bilbm-detail
+wandb_project: ar-bilbm-detailtest
+save_ckpt_path: /root/storage/shuqian/LBM_out/ar-bilbm-detailtest
 
 train_mode: backbone_only
 log_interval: 125        #隔多久想swanlab记录一次 loss/train  5epoch
@@ -10,7 +10,7 @@ max_epochs: 600
 bridge_noise_sigma: 0.005
 
 save_interval: 2500
-val_check_interval: 250
+val_check_interval: 125
 limit_val_batches: 6
 
 eval_num_steps: [1, 2, 4]
@@ -86,14 +86,14 @@ eval_save_dir: null          # null -> save_ckpt_path/eval_images
 eval_external_metrics: true
 
 # Only calculate external metrics for 1-step and 4-step generations
-eval_external_metrics_steps: [1, 4]
-eval_external_metrics_every_n_evals: 2
+eval_external_metrics_steps: [1]
+eval_external_metrics_every_n_evals: 1
 eval_external_metrics_device: cuda:0   # cpu cuda
 eval_external_metrics_cuda_visible_devices: "1"  #计算外部指标用的gpu
 eval_external_metrics_batch_size: 4
 
 # Direction-aware metric calculation
-eval_external_metrics_directions: ["s2p", "p2s"]
+eval_external_metrics_directions: ["p2s"]
 
 # s2p: generated photo vs real photo
 eval_gt_dir_s2p: /root/shuqian/dataset/AR_LBM_raw/test_B

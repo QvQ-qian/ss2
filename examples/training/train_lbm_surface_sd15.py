@@ -1375,6 +1375,13 @@ class SwanLabEvalCallback(Callback):
         # ------------------------------------------------------------
         metric_device = str(self.external_metrics_device)
         env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env["OMP_NUM_THREADS"] = "2"
+        env["MKL_NUM_THREADS"] = "2"
+        env["OPENBLAS_NUM_THREADS"] = "2"
+        env["NUMEXPR_NUM_THREADS"] = "2"
+        env["VECLIB_MAXIMUM_THREADS"] = "2"
+        env["TORCH_NUM_THREADS"] = "2"
 
         if metric_device.lower() == "cpu":
             env["CUDA_VISIBLE_DEVICES"] = ""
@@ -1401,6 +1408,7 @@ class SwanLabEvalCallback(Callback):
 
         cmd = [
             sys.executable,
+            "-u",
             self.external_metrics_script,
             "--gt_dir", str(gt_dir),
             "--gen_dir", str(gen_dir),
