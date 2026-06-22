@@ -1,5 +1,5 @@
-wandb_project: ar-bilbm-detail
-save_ckpt_path: /root/storage/shuqian/LBM_out/ar-bilbm-detail
+wandb_project: ar-bilbm-detail-v1
+save_ckpt_path: /root/storage/shuqian/LBM_out/ar-bilbm-detail-v1
 
 train_mode: backbone_only
 log_interval: 125        #隔多久想swanlab记录一次 loss/train  5epoch
@@ -89,7 +89,7 @@ eval_external_metrics: true
 eval_external_metrics_steps: [1, 4]
 eval_external_metrics_every_n_evals: 2
 eval_external_metrics_device: cuda:0   # cpu cuda
-eval_external_metrics_cuda_visible_devices: "1"  #计算外部指标用的gpu
+eval_external_metrics_cuda_visible_devices: "2"  #计算外部指标用的gpu
 eval_external_metrics_batch_size: 4
 
 # Direction-aware metric calculation

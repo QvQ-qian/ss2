@@ -82,17 +82,18 @@ def main():
             import rank_new
 
             rank_metrics = rank_new.calculate(
-                gt_dir=args.gt_dir,
-                gen_dir=args.gen_dir,
+                gallery=args.gt_dir,
+                probe=args.gen_dir,
             )
 
             for k, v in rank_metrics.items():
                 if isinstance(v, (int, float)):
-                    metrics[f"external/{k}_step{args.step_num}"] = float(v)
+                    metrics[f"external/{k}_step{step}"] = float(v)
 
         except Exception as e:
             print(f"[ExternalMetrics] rank_new failed: {repr(e)}")
-            metrics[f"external/rank_failed_step{args.step_num}"] = 1.0
+            metrics[f"external/rank_failed_step{step}"] = 1.0
+
 
     os.makedirs(os.path.dirname(args.out_json), exist_ok=True)
 

@@ -106,7 +106,7 @@ export SLURM_NNODES=1
 export SLURM_PROCID=0
 export SLURM_JOB_ID=0
 
-CUDA_VISIBLE_DEVICES=0 python examples/training/train_lbm_surface_sd15.py \
+CUDA_VISIBLE_DEVICES=1 python examples/training/train_lbm_surface_sd15.py \
   --path_config examples/training/config/ar_surface_bilbm_twobridge_v3.yaml
 ```
 ## 1.生成face parsing
