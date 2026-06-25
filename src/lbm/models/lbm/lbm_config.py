@@ -119,6 +119,10 @@ class LBMConfig(ModelConfig):
 
     reverse_loss_weight: float = 0.5
     reverse_use_pixel_loss: bool = False
+    reverse_pixel_loss_type: Optional[
+        Literal["l2", "l1", "lpips", "dists", "ea_dists"]
+    ] = None
+    reverse_pixel_loss_weight: Optional[float] = None
     reverse_use_id_loss: bool = False
     reverse_use_local_edge_loss: bool = False
 

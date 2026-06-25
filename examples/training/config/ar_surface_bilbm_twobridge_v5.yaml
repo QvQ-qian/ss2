@@ -1,0 +1,211 @@
+wandb_project: ar-bilbm-detail-v5-custom_timesteps
+save_ckpt_path: /root/storage/shuqian/LBM_out/ar-bilbm-detail-v5-custom_timesteps
+
+train_mode: backbone_only
+log_interval: 125        #隔多久想swanlab记录一次 loss/train  5epoch
+resume_from_checkpoint: false  #是否继续训练
+init_from_checkpoint: null
+
+max_epochs: 600
+bridge_noise_sigma: 0.005
+
+save_interval: 2500
+val_check_interval: 250
+limit_val_batches: 6
+
+eval_num_steps: [1, 2, 4]
+eval_max_batches: 6
+eval_max_samples: 4
+eval_upload_images: false
+eval_compute_fid: false
+
+# =========================
+# Bi-LBM: two-bridge direction-aware training
+# =========================
+bidirectional: true
+bidirectional_mode: "two_bridge"
+direction_aware: true
+num_directions: 2
+direction_embed_init: 0.0
+
+# direction_id = 0:
+# image/sketch -> normal/photo
+#
+# direction_id = 1:
+# normal/photo -> image/sketch
+# P2S: photo -> sketch
+reverse_pixel_loss_type: lpips   #用l1只提升ssim mssim，会降低fid等，不划算
+reverse_pixel_loss_weight: 10.0
+reverse_loss_weight: 1.0
+
+# Balanced bidirectional image-level loss:
+# S2P: latent loss + 10 * LPIPS
+# P2S: latent loss + 10 * L1
+reverse_use_pixel_loss: true
+reverse_use_id_loss: false
+reverse_use_local_edge_loss: false
+
+# Evaluation directions
+eval_directions: ["s2p", "p2s"]
+eval_save_p2s_images: true
+
+# ---------- Bridge-aware SCSA-MAAM Skip Refinement ----------
+use_bridge_maam: false
+
+# residual: E' = E + alpha * (F - E)
+# direct: E' = F
+bridge_maam_mode: residual
+
+# first version: only high-resolution skip
+# options: high / mid / all
+bridge_maam_levels: ["high"]
+
+# use SCSA instead of original CBAM-style CA/SA
+bridge_maam_attn_type: scsa
+
+# initialization
+bridge_maam_alpha_init: 0.01
+bridge_maam_attn_bias_init: 2.0
+
+# bridge-aware timestep branch
+bridge_maam_use_timestep: true
+bridge_maam_zero_init_timestep: true
+
+# SCSA settings
+bridge_maam_scsa_groups: 4
+bridge_maam_scsa_kernels: [3, 5, 7, 9]
+bridge_maam_scsa_pool_size: 7
+
+# =========================
+# Save validation images
+# =========================
+eval_save_images: true
+eval_save_size: [200, 250]   # [width, height]
+eval_save_dir: null          # null -> save_ckpt_path/eval_images
+
+# =========================
+# External metrics
+# =========================
+eval_external_metrics: true
+
+# Only calculate external metrics for 1-step and 4-step generations
+eval_external_metrics_steps: [1, 4]
+eval_external_metrics_every_n_evals: 2
+eval_external_metrics_device: cuda:0   # cpu cuda
+eval_external_metrics_cuda_visible_devices: "0"  #计算外部指标用的gpu
+eval_external_metrics_batch_size: 4
+
+# Direction-aware metric calculation
+eval_external_metrics_directions: ["s2p", "p2s"]
+
+# s2p: generated photo vs real photo
+eval_gt_dir_s2p: /root/shuqian/dataset/AR_LBM_raw/test_B
+
+# p2s: generated sketch vs real sketch
+eval_gt_dir_p2s: /root/shuqian/dataset/AR_LBM_raw/test_A
+
+# s2p calculates ALL + rank_new
+eval_external_image_metrics_s2p: true
+eval_external_rank_metrics_s2p: true
+
+# p2s calculates ALL only, no rank_new
+eval_external_image_metrics_p2s: true
+eval_external_rank_metrics_p2s: false
+
+# Old global fields, kept for compatibility with existing code
+eval_gt_dir: /root/shuqian/dataset/AR_LBM_raw/test_B
+eval_external_image_metrics: true
+eval_external_rank_metrics: true
+
+# Cache / local checkpoints for external metrics
+eval_external_deepface_home: /root/shuqian/checkpoints
+eval_external_inception_v3_path: /root/shuqian/checkpoints/inception_v3_google-0cc3c7bd.pth
+
+# External metrics script
+eval_external_metrics_script: tools/calc_external_metrics.py
+eval_external_metrics_wait_on_fit_end: true
+# <= 0 表示无限等待，直到 pending_metric_jsons 全部完成并上传
+eval_external_metrics_wait_timeout: 21600   # 6小时
+eval_external_metrics_poll_interval: 10
+
+# =========================
+# Backbone / data
+# =========================
+backbone_signature: /root/dataset/weights/stable-diffusion-v1-5-min
+
+train_shards:
+  - /root/shuqian/dataset/AR_LBM_wds/ar_train-{000000..000000}.tar
+
+validation_shards:
+  - /root/shuqian/dataset/AR_LBM_wds/ar_val-{000000..000000}.tar
+
+source_key: image
+target_key: normal
+mask_key: mask
+
+batch_size: 4
+learning_rate: 5.0e-5
+optimizer: AdamW
+
+num_steps: [1, 2, 4]
+timestep_sampling: custom_timesteps
+selected_timesteps: [250, 500, 750, 1000]
+prob: [0.25, 0.25, 0.25, 0.25]
+
+unet_input_channels: 4
+vae_num_channels: 4
+
+# =========================
+# Losses
+# =========================
+# S2P: sketch -> photo
+pixel_loss_type: lpips
+pixel_loss_weight: 10.0
+
+latent_loss_type: l2
+latent_loss_weight: 1.0
+
+
+
+
+# Local edge loss, currently disabled
+local_edge_loss_weight: 0.75
+local_edge_parts: ["eye"]
+local_edge_dilate_kernel: 7
+
+# Exclude eyeglasses label = 6
+local_edge_exclude_labels: [6]
+local_edge_exclude_dilate_kernel: 7
+
+# ID loss, currently disabled
+id_loss_weight: 0.0
+id_loss_model_path: /root/shuqian/checkpoints/model_ir_se50.pth
+id_loss_crop: false
+
+# =========================
+# Conditioning
+# =========================
+conditioning_images_keys: []
+conditioning_masks_keys: []
+
+# =========================
+# Face Parsing Adapter V1
+# =========================
+use_face_adapter: false
+parse_key: parse
+parse_num_classes: 19
+parse_adapter_scale: 0.5
+parse_adapter_condition_dropout: 0.0
+parse_adapter_include_mid: false
+parse_adapter_zero_init: true
+
+# Future coarse face adapter, disabled in V1
+use_coarse_face_adapter: false
+coarse_face_key: null
+
+# =========================
+# VAE encoder-decoder skip
+# =========================
+use_vae_skip: false
+vae_skip_zero_init: true
+vae_skip_gamma: 1.0

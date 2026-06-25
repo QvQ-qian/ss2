@@ -90,6 +90,18 @@ class LBMModel(BaseModel):
         self.num_directions = getattr(config, "num_directions", 2)
         self.reverse_loss_weight = float(getattr(config, "reverse_loss_weight", 0.5))
         self.reverse_use_pixel_loss = getattr(config, "reverse_use_pixel_loss", False)
+
+        self.reverse_pixel_loss_type = (
+                getattr(config, "reverse_pixel_loss_type", None) or self.pixel_loss_type
+        )
+
+        _reverse_pixel_loss_weight = getattr(config, "reverse_pixel_loss_weight", None)
+        self.reverse_pixel_loss_weight = (
+            self.pixel_loss_weight
+            if _reverse_pixel_loss_weight is None
+            else float(_reverse_pixel_loss_weight)
+        )
+
         self.reverse_use_id_loss = getattr(config, "reverse_use_id_loss", False)
         self.reverse_use_local_edge_loss = getattr(
             config, "reverse_use_local_edge_loss", False
@@ -158,24 +170,37 @@ class LBMModel(BaseModel):
                 exclude_dilate_kernel=self.local_edge_exclude_dilate_kernel,
             )
 
+        needs_lpips = (
+                              self.pixel_loss_weight > 0 and self.pixel_loss_type == "lpips"
+                      ) or (
+                              self.reverse_use_pixel_loss
+                              and self.reverse_pixel_loss_weight > 0
+                              and self.reverse_pixel_loss_type == "lpips"
+                      )
 
-        if self.pixel_loss_weight > 0:
-            if self.pixel_loss_type == "lpips":
-                self.lpips_loss = lpips.LPIPS(net="vgg")
+        needs_ea_dists = (
+                                 self.pixel_loss_weight > 0 and self.pixel_loss_type in {"dists", "ea_dists"}
+                         ) or (
+                                 self.reverse_use_pixel_loss
+                                 and self.reverse_pixel_loss_weight > 0
+                                 and self.reverse_pixel_loss_type in {"dists", "ea_dists"}
+                         )
 
-            elif self.pixel_loss_type in {"dists", "ea_dists"}:
-                use_edge = (
-                        self.pixel_loss_type == "ea_dists"
-                        and getattr(config, "ea_dists_use_edge", True)
-                )
+        if needs_lpips:
+            self.lpips_loss = lpips.LPIPS(net="vgg")
 
-                self.ea_dists_loss = EADISTSLoss(
-                    edge_weight=getattr(config, "ea_dists_edge_weight", 1.0),
-                    use_edge=use_edge,
-                    edge_to_rgb=getattr(config, "ea_dists_edge_to_rgb", True),
-                    edge_normalize=getattr(config, "ea_dists_edge_normalize", True),
-                    resize_to=getattr(config, "ea_dists_resize_to", None),
-                )
+        if needs_ea_dists:
+            use_edge = (
+                    self.pixel_loss_type == "ea_dists"
+                    or self.reverse_pixel_loss_type == "ea_dists"
+            )
+            self.ea_dists_loss = EADISTSLoss(
+                edge_weight=getattr(config, "ea_dists_edge_weight", 1.0),
+                use_edge=use_edge and getattr(config, "ea_dists_use_edge", True),
+                edge_to_rgb=getattr(config, "ea_dists_edge_to_rgb", True),
+                edge_normalize=getattr(config, "ea_dists_edge_normalize", True),
+                resize_to=getattr(config, "ea_dists_resize_to", None),
+            )
 
         if self.id_loss_weight > 0:
             self.id_loss = ArcFaceIDLoss(
@@ -552,10 +577,10 @@ class LBMModel(BaseModel):
         #   10 * LPIPS(pred_sketch, gt_sketch)
         # ------------------------------------------------------------
         if self.reverse_use_pixel_loss:
-            if self.pixel_loss_weight <= 0:
+            if self.reverse_pixel_loss_weight <= 0:
                 raise ValueError(
-                    "reverse_use_pixel_loss=True but pixel_loss_weight <= 0. "
-                    "Set pixel_loss_weight=10.0 if you want P2S to use 10*LPIPS."
+                    "reverse_use_pixel_loss=True but reverse_pixel_loss_weight <= 0. "
+                    "Set reverse_pixel_loss_weight=10.0 if you want P2S to use pixel loss."
                 )
 
             pixel_loss_p2s, _, _ = self.image_losses(
@@ -563,9 +588,12 @@ class LBMModel(BaseModel):
                 pixels_A.detach(),
                 valid_mask,
                 parse=None,
+                pixel_loss_type=self.reverse_pixel_loss_type,
+                pixel_loss_weight=self.reverse_pixel_loss_weight,
             )
 
-            loss_p2s = loss_p2s + self.pixel_loss_weight * pixel_loss_p2s
+            loss_p2s = loss_p2s + self.reverse_pixel_loss_weight * pixel_loss_p2s
+
             pixel_loss_p2s_log = (
                 pixel_loss_p2s.mean()
                 if hasattr(pixel_loss_p2s, "mean")
@@ -933,7 +961,19 @@ class LBMModel(BaseModel):
                 f"Loss type {self.latent_loss_type} not implemented"
             )
 
-    def image_losses(self, prediction, model_input, valid_mask, parse=None):
+    def image_losses(
+            self,
+            prediction,
+            model_input,
+            valid_mask,
+            parse=None,
+            pixel_loss_type: Optional[str] = None,
+            pixel_loss_weight: Optional[float] = None,
+    ):
+        active_pixel_loss_type = pixel_loss_type or self.pixel_loss_type
+        active_pixel_loss_weight = (
+            self.pixel_loss_weight if pixel_loss_weight is None else float(pixel_loss_weight)
+        )
         latent_crop = self.pixel_loss_max_size // self.vae.downsampling_factor
         input_crop = self.pixel_loss_max_size
 
@@ -1033,10 +1073,10 @@ class LBMModel(BaseModel):
         decoded_prediction = self.vae.decode(prediction).clamp(-1, 1)
 
         # ---------- pixel loss ----------
-        if self.pixel_loss_weight <= 0:
+        if active_pixel_loss_weight <= 0:
             pixel_loss = torch.zeros(model_input.shape[0], device=model_input.device)
 
-        elif self.pixel_loss_type == "l2":
+        elif active_pixel_loss_type == "l2":
             pixel_loss = torch.mean(
                 (
                         (decoded_prediction * valid_mask - model_input * valid_mask) ** 2
@@ -1044,40 +1084,42 @@ class LBMModel(BaseModel):
                 1,
             )
 
-        elif self.pixel_loss_type == "l1":
+        elif active_pixel_loss_type == "l1":
             pixel_loss = torch.mean(
-                torch.abs(
-                    decoded_prediction * valid_mask - model_input * valid_mask
-                ).reshape(model_input.shape[0], -1),
+                torch.abs(decoded_prediction * valid_mask - model_input * valid_mask).reshape(
+                    model_input.shape[0], -1
+                ),
                 1,
             )
 
-        elif self.pixel_loss_type == "lpips":
+        elif active_pixel_loss_type == "lpips":
+            if self.lpips_loss is None:
+                raise RuntimeError(
+                    "pixel_loss_type='lpips' but lpips_loss is not initialized."
+                )
             pixel_loss = self.lpips_loss(
                 decoded_prediction * valid_mask,
                 model_input * valid_mask,
             ).mean()
 
-        elif self.pixel_loss_type in {"dists", "ea_dists"}:
+        elif active_pixel_loss_type in {"dists", "ea_dists"}:
             if self.ea_dists_loss is None:
                 raise RuntimeError(
-                    f"pixel_loss_type={self.pixel_loss_type} "
+                    f"pixel_loss_type={active_pixel_loss_type} "
                     f"but ea_dists_loss is not initialized."
                 )
-
             pixel_loss, ea_logs = self.ea_dists_loss(
                 decoded_prediction * valid_mask,
                 model_input * valid_mask,
                 return_dict=True,
             )
-
             self._last_ea_dists_dists_loss = ea_logs["dists"]
             self._last_ea_dists_edge_loss = ea_logs["edge"]
             self._last_ea_dists_total_loss = ea_logs["total"]
 
         else:
             raise NotImplementedError(
-                f"Pixel loss type {self.pixel_loss_type} not implemented"
+                f"Pixel loss type {active_pixel_loss_type} not implemented"
             )
 
         # ---------- local edge loss ----------
